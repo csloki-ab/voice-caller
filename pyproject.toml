@@ -1,0 +1,14 @@
+[project]
+name = "voice-caller"
+version = "0.1.0"
+description = "Pipecat outbound dietary-inquiry voice agent (Twilio + Deepgram + OpenAI + ElevenLabs)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]>=1.4.0",
+  "twilio",
+  "fastapi",
+  "uvicorn",
+  "python-dotenv",
+  "loguru",
+]
