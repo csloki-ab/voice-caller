@@ -148,6 +148,9 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
         method="POST",
         record=record,
         recording_channels="dual",
+        # Hard backstop: end the call after 6 min so a silent/voicemail line
+        # can't sit open running up cost. Normal calls finish well under this.
+        time_limit=360,
     )
 
     return TwilioCallResult(call_sid=call.sid, to_number=to_number)

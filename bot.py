@@ -70,12 +70,20 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     # aren't accepted by this SDK build, fall back to the plain service so a
     # call never fails to start over an STT config detail.
     _dg_key = os.getenv("DEEPGRAM_API_KEY")
-    # ":N" is Deepgram keyword-boost intensity — higher = more likely to be heard.
-    DIET_KEYWORDS = [
-        "scallion:3", "scallions:3", "allium:2", "shallot:2", "leek:2", "chive:2",
-        "paneer:2", "ghee:2", "tofu:2", "seitan:2", "lentil:2", "chickpea:2",
-        "vegan:2", "Jain:3", "truffle:3", "asafoetida:2", "hing:2",
+    # The dietary vocabulary to boost so 8kHz audio doesn't mangle it (plain terms).
+    DIET_TERMS = [
+        "scallion", "scallions", "allium", "shallot", "leek", "chive",
+        "paneer", "ghee", "tofu", "seitan", "lentil", "chickpea",
+        "vegan", "Jain", "truffle", "asafoetida", "hing",
     ]
+    # nova-3 (default; lower WER incl. 8kHz) boosts via keyterm prompting (plain
+    # terms). nova-2* uses keywords with ":N" intensities. Passing the wrong one
+    # for the model makes Deepgram reject the connection, so branch on the model.
+    _dg_model = os.getenv("DEEPGRAM_MODEL", "nova-3-general")
+    if _dg_model.startswith("nova-3"):
+        _dg_boost = {"keyterm": DIET_TERMS}
+    else:
+        _dg_boost = {"keywords": [f"{t}:2" for t in DIET_TERMS]}
     try:
         # pipecat ships its own LiveOptions compat wrapper; the deepgram SDK no
         # longer exports LiveOptions at top level (that import silently fell back
@@ -85,11 +93,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         stt = DeepgramSTTService(
             api_key=_dg_key,
             live_options=LiveOptions(
-                model=os.getenv("DEEPGRAM_MODEL", "nova-2-phonecall"),
+                model=_dg_model,
                 language="en-US",
                 smart_format=True,
                 punctuate=True,
-                keywords=DIET_KEYWORDS,
+                **_dg_boost,
             ),
         )
     except Exception as e:
