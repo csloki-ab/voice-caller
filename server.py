@@ -29,6 +29,28 @@ from server_utils import (
 load_dotenv(override=True)
 
 
+# Fail loudly at boot if a required secret is blank. Without this a missing key
+# doesn't crash the server — the call connects and then goes silent mid-call
+# (exactly the failure we're migrating away from), which is very hard to debug.
+REQUIRED_ENV = [
+    "DEEPGRAM_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_VOICE_ID",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_FROM_NUMBER",
+    "LOCAL_SERVER_URL",
+]
+_missing = [k for k in REQUIRED_ENV if not (os.getenv(k) or "").strip()]
+if _missing:
+    raise RuntimeError(
+        "Missing required environment variables: "
+        + ", ".join(_missing)
+        + ". Set them in Railway → Variables before deploying."
+    )
+
+
 app = FastAPI()
 
 

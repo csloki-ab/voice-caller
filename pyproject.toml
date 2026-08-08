@@ -5,7 +5,7 @@ description = "Pipecat outbound dietary-inquiry voice agent (Twilio + Deepgram +
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]>=1.4.0",
+  "pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]==1.7.0",
   "twilio",
   "fastapi",
   "uvicorn",

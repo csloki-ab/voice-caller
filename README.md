@@ -1,7 +1,7 @@
 # voice-caller — your own outbound dietary-inquiry voice agent
 
 Replaces Retell. Owns the whole media path (no Retell SBC), so the one-way-audio
-bug goes away. Pipeline: **Twilio ⇄ Deepgram (STT) → OpenAI (our tuned prompt) → ElevenLabs (Monika) ⇄ Twilio**, running on **Railway**.
+bug goes away. Pipeline: **Twilio ⇄ Deepgram (STT) → Anthropic Claude (our tuned prompt) → ElevenLabs (Adam) ⇄ Twilio**, running on **Railway**.
 
 Based on Pipecat's official `twilio-chatbot/outbound` example, customized for our use case.
 
@@ -13,7 +13,7 @@ Based on Pipecat's official `twilio-chatbot/outbound` example, customized for ou
 - `pyproject.toml`, `Dockerfile`, `env.example`.
 
 ## Keys you need (all go into Railway → Variables; you never paste them into chat)
-See `env.example`. In short: **Deepgram** key, **OpenAI** key, **ElevenLabs** key + the **Monika voice id**, and **Twilio** SID + auth token + a purchased number.
+See `env.example`. In short: **Deepgram** key, **Anthropic** key, **ElevenLabs** key + the **Adam voice id**, and **Twilio** SID + auth token + a purchased number.
 
 ## Deploy to Railway
 1. Push this folder to a GitHub repo (or use `railway up` from the Railway CLI).

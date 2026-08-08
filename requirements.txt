@@ -1,4 +1,4 @@
-pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]>=1.4.0
+pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]==1.7.0
 twilio
 fastapi
 uvicorn

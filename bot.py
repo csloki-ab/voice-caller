@@ -1,8 +1,8 @@
 #
 # voice-caller — Pipecat outbound dietary-inquiry bot
 # Based on pipecat-examples/twilio-chatbot/outbound, customized to:
-#   - use ElevenLabs (the "Monika" voice) for TTS
-#   - use OpenAI for the LLM
+#   - use ElevenLabs (the "Adam" voice) for TTS
+#   - use Anthropic Claude (Sonnet) for the LLM
 #   - load our tuned dietary-inquiry system prompt from prompt.txt
 #   - inject per-call context (restaurant_name, call_notes, cuisine, ...) that
 #     arrives as Twilio <Stream> parameters (see server_utils.generate_twiml)
@@ -66,7 +66,7 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),  # the ElevenLabs "Monika" (en-IN) voice id
+        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),  # the ElevenLabs "Adam" voice id
         model=os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
         params=ElevenLabsTTSService.InputParams(speed=0.9),
     )
@@ -83,8 +83,8 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             transport.input(),   # audio in from Twilio
             stt,                 # speech -> text (Deepgram)
             user_aggregator,
-            llm,                 # OpenAI (our tuned prompt)
-            tts,                 # text -> speech (ElevenLabs Monika)
+            llm,                 # Anthropic Claude (our tuned prompt)
+            tts,                 # text -> speech (ElevenLabs Adam)
             transport.output(),  # audio out to Twilio
             assistant_aggregator,
         ]

@@ -116,7 +116,7 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
     to_number = dialout_request.to_number
     from_number = dialout_request.from_number
 
-    local_server_url = os.getenv("LOCAL_SERVER_URL")
+    local_server_url = (os.getenv("LOCAL_SERVER_URL") or "").strip().rstrip("/")
     if not local_server_url:
         raise ValueError("Missing LOCAL_SERVER_URL")
 
@@ -164,33 +164,24 @@ async def parse_twiml_request(request: Request) -> TwimlRequest:
 
 
 def get_websocket_url() -> str:
-    """Get the appropriate WebSocket URL based on environment.
+    """Build the WebSocket URL Twilio Media Streams connects back to.
 
-    Returns the local WebSocket URL for local development or the Pipecat Cloud
-    URL for production deployments.
+    We always self-host (Railway), so this is derived directly from
+    LOCAL_SERVER_URL — we never route to Pipecat Cloud. Robust to a
+    trailing slash and to an http:// (vs https://) scheme.
 
     Returns:
         str: WebSocket URL (wss://) for Twilio Media Streams to connect to.
 
     Raises:
-        ValueError: If LOCAL_SERVER_URL is missing in local environment.
+        ValueError: If LOCAL_SERVER_URL is missing/blank.
     """
-    if os.getenv("ENV", "local").lower() == "local":
-        local_server_url = os.getenv("LOCAL_SERVER_URL")
-        if not local_server_url:
-            raise ValueError("Missing LOCAL_SERVER_URL")
-        # Convert https:// to wss://
-        ws_url = local_server_url.replace("https://", "wss://")
-        return f"{ws_url}/ws"
-    else:
-        print("If deployed in a region other than us-west (default), update websocket url!")
-
-        ws_url = "wss://api.pipecat.daily.co/ws/twilio"
-        # uncomment appropriate region url:
-        # ws_url = wss://us-east.api.pipecat.daily.co/ws/twilio
-        # ws_url = wss://eu-central.api.pipecat.daily.co/ws/twilio
-        # ws_url = wss://ap-south.api.pipecat.daily.co/ws/twilio
-        return ws_url
+    local_server_url = (os.getenv("LOCAL_SERVER_URL") or "").strip().rstrip("/")
+    if not local_server_url:
+        raise ValueError("Missing LOCAL_SERVER_URL")
+    # Convert https:// (or http://) to wss:// so Twilio streams over TLS.
+    ws_url = local_server_url.replace("https://", "wss://").replace("http://", "wss://")
+    return f"{ws_url}/ws"
 
 
 def generate_twiml(twiml_request: TwimlRequest) -> str:
