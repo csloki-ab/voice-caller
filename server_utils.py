@@ -133,9 +133,22 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
     if not account_sid or not auth_token:
         raise ValueError("Missing Twilio credentials")
 
-    # Create Twilio client and make the call
+    # Create Twilio client and make the call.
+    # record=True captures BOTH sides of the call (dual channel = agent on one
+    # track, restaurant on the other) so we keep an audio record of every call —
+    # essential for holding a restaurant's answer, including a "no". Recordings
+    # live in Twilio (Console → Monitor → Recordings) and are retrievable by API.
+    # Toggle off with CALL_RECORDING=off if ever needed.
+    record = os.getenv("CALL_RECORDING", "on").lower() != "off"
     client = TwilioClient(account_sid, auth_token)
-    call = client.calls.create(to=to_number, from_=from_number, url=twiml_url, method="POST")
+    call = client.calls.create(
+        to=to_number,
+        from_=from_number,
+        url=twiml_url,
+        method="POST",
+        record=record,
+        recording_channels="dual",
+    )
 
     return TwilioCallResult(call_sid=call.sid, to_number=to_number)
 
