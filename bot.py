@@ -77,7 +77,10 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         "vegan:2", "Jain:3", "truffle:3", "asafoetida:2", "hing:2",
     ]
     try:
-        from deepgram import LiveOptions
+        # pipecat ships its own LiveOptions compat wrapper; the deepgram SDK no
+        # longer exports LiveOptions at top level (that import silently fell back
+        # to default STT, so the telephony model + keyword boost never loaded).
+        from pipecat.services.deepgram.stt import LiveOptions
 
         stt = DeepgramSTTService(
             api_key=_dg_key,
