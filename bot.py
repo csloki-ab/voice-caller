@@ -62,7 +62,34 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
     )
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    # STT: default to a telephony-tuned Deepgram model and BOOST the dietary
+    # vocabulary so 8kHz phone audio doesn't mangle key words (e.g. hearing
+    # "scallions" as "scallops"). Wrapped defensively: if the enhanced options
+    # aren't accepted by this SDK build, fall back to the plain service so a
+    # call never fails to start over an STT config detail.
+    _dg_key = os.getenv("DEEPGRAM_API_KEY")
+    # ":N" is Deepgram keyword-boost intensity — higher = more likely to be heard.
+    DIET_KEYWORDS = [
+        "scallion:3", "scallions:3", "allium:2", "shallot:2", "leek:2", "chive:2",
+        "paneer:2", "ghee:2", "tofu:2", "seitan:2", "lentil:2", "chickpea:2",
+        "vegan:2", "Jain:3", "truffle:3", "asafoetida:2", "hing:2",
+    ]
+    try:
+        from deepgram import LiveOptions
+
+        stt = DeepgramSTTService(
+            api_key=_dg_key,
+            live_options=LiveOptions(
+                model=os.getenv("DEEPGRAM_MODEL", "nova-2-phonecall"),
+                language="en-US",
+                smart_format=True,
+                punctuate=True,
+                keywords=DIET_KEYWORDS,
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"Deepgram enhanced options unavailable ({e}); using defaults")
+        stt = DeepgramSTTService(api_key=_dg_key)
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
@@ -81,17 +108,44 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
-    pipeline = Pipeline(
-        [
-            transport.input(),   # audio in from Twilio
-            stt,                 # speech -> text (Deepgram)
-            user_aggregator,
-            llm,                 # Anthropic Claude (our tuned prompt)
-            tts,                 # text -> speech (ElevenLabs Adam)
-            transport.output(),  # audio out to Twilio
-            assistant_aggregator,
-        ]
-    )
+    # Clean transcript logging: emit readable "TRANSCRIPT | USER: ..." /
+    # "TRANSCRIPT | ASSISTANT: ..." lines to the deploy logs so we can review
+    # exactly what each side said (the raw DEBUG frames don't give a usable
+    # transcript). Wrapped defensively — if this pipecat build's API differs,
+    # transcript logging simply turns off and the call still runs normally.
+    transcript_user = transcript_assistant = None
+    try:
+        from pipecat.processors.transcript_processor import TranscriptProcessor
+
+        transcript = TranscriptProcessor()
+        transcript_user = transcript.user()
+        transcript_assistant = transcript.assistant()
+
+        @transcript.event_handler("on_transcript_update")
+        async def on_transcript_update(processor, frame):
+            for msg in frame.messages:
+                logger.info(f"TRANSCRIPT | {msg.role.upper()}: {msg.content}")
+    except Exception as e:
+        logger.warning(f"Transcript logging disabled ({e})")
+        transcript_user = transcript_assistant = None
+
+    stages = [
+        transport.input(),   # audio in from Twilio
+        stt,                 # speech -> text (Deepgram)
+    ]
+    if transcript_user is not None:
+        stages.append(transcript_user)      # capture the caller's (restaurant's) words
+    stages += [
+        user_aggregator,
+        llm,                 # Anthropic Claude (our tuned prompt)
+        tts,                 # text -> speech (ElevenLabs Adam)
+        transport.output(),  # audio out to Twilio
+    ]
+    if transcript_assistant is not None:
+        stages.append(transcript_assistant)  # capture what the agent said
+    stages.append(assistant_aggregator)
+
+    pipeline = Pipeline(stages)
 
     worker = PipelineWorker(
         pipeline,
