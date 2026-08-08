@@ -1,16 +1,17 @@
-FROM dailyco/pipecat-base:latest
+# Clean, Railway-friendly image (the example's uv/pipecat-base Dockerfile doesn't build here).
+FROM python:3.12-slim
 
-# Enable bytecode compilation
-ENV UV_COMPILE_BYTECODE=1
+WORKDIR /app
 
-# Copy from the cache instead of linking since it's a mounted volume
-ENV UV_LINK_MODE=copy
+# build-essential covers any package that needs to compile a wheel.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the project's dependencies using the lockfile and settings
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project --no-dev
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application code
-COPY ./bot.py bot.py
+COPY . .
+
+# server.py binds 0.0.0.0:$PORT (Railway injects PORT) and serves /dialout, /twiml, /ws.
+CMD ["python", "server.py"]

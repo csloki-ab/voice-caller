@@ -1,0 +1,6 @@
+pipecat-ai[websocket,elevenlabs,anthropic,silero,deepgram,runner]>=1.4.0
+twilio
+fastapi
+uvicorn
+python-dotenv
+loguru
