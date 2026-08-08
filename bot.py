@@ -56,10 +56,12 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
 
     llm = AnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
-        # Sonnet = best balance for real-time voice (smart enough for the nuance,
-        # fast enough to avoid dead air). Drop to claude-haiku-4-5 if latency bites;
-        # avoid Opus here — it's the slowest and the extra reasoning is wasted.
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
+        # Haiku 4.5 = the latency sweet spot for real-time voice (~0.4s to first
+        # token). Sonnet's ~2s first-token made calls feel sluggish; Opus is worse.
+        model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+        # Cache the ~7.7k-token system prompt so it isn't reprocessed every turn
+        # (0.1x input cost after turn 1 + faster TTFT). ~3-min calls fit the 5-min TTL.
+        params=AnthropicLLMService.InputParams(enable_prompt_caching=True),
     )
 
     # STT: default to a telephony-tuned Deepgram model and BOOST the dietary
@@ -101,51 +103,51 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         params=ElevenLabsTTSService.InputParams(speed=float(os.getenv("ELEVENLABS_SPEED", "1.0"))),
     )
 
+    # Turn-taking / barge-in tuning. pipecat's DEFAULT lets ANY 200ms of speech
+    # (a breath, a one-word overlap, kitchen noise) instantly interrupt the bot,
+    # which produced a greeting-collision loop on real calls. Fix (verified vs
+    # pipecat 1.7.0 source):
+    #   - MinWordsUserTurnStartStrategy(3): while the bot is speaking, an
+    #     interruption needs >=3 real words (interims count, so it stays fast);
+    #     while the bot is silent, a single word still starts a turn. Replaces
+    #     BOTH default start strategies. Stop strategy is left as the default
+    #     smart-turn analyzer (correct for "callee pauses to check the kitchen").
+    #   - FirstSpeechUserMuteStrategy: guarantees the opening greeting plays to
+    #     completion once, no matter what the caller does over it.
+    # Wrapped defensively: if a strategy API ever differs, fall back to defaults
+    # so a call still runs (just with the old, twitchier turn-taking).
+    user_params_kwargs = dict(vad_analyzer=SileroVADAnalyzer())
+    try:
+        from pipecat.turns.user_turn_strategies import UserTurnStrategies
+        from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+        from pipecat.turns.user_mute import FirstSpeechUserMuteStrategy
+
+        user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
+            start=[MinWordsUserTurnStartStrategy(min_words=3)],
+        )
+        user_params_kwargs["user_mute_strategies"] = [FirstSpeechUserMuteStrategy()]
+        logger.info("Barge-in tuning active: MinWords(3) + FirstSpeechMute")
+    except Exception as e:
+        logger.warning(f"Turn-taking strategies unavailable ({e}); using pipecat defaults")
+
     # Seed the conversation with our tuned system prompt for THIS restaurant.
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(**user_params_kwargs),
     )
 
-    # Clean transcript logging: emit readable "TRANSCRIPT | USER: ..." /
-    # "TRANSCRIPT | ASSISTANT: ..." lines to the deploy logs so we can review
-    # exactly what each side said (the raw DEBUG frames don't give a usable
-    # transcript). Wrapped defensively — if this pipecat build's API differs,
-    # transcript logging simply turns off and the call still runs normally.
-    transcript_user = transcript_assistant = None
-    try:
-        from pipecat.processors.transcript_processor import TranscriptProcessor
-
-        transcript = TranscriptProcessor()
-        transcript_user = transcript.user()
-        transcript_assistant = transcript.assistant()
-
-        @transcript.event_handler("on_transcript_update")
-        async def on_transcript_update(processor, frame):
-            for msg in frame.messages:
-                logger.info(f"TRANSCRIPT | {msg.role.upper()}: {msg.content}")
-    except Exception as e:
-        logger.warning(f"Transcript logging disabled ({e})")
-        transcript_user = transcript_assistant = None
-
-    stages = [
-        transport.input(),   # audio in from Twilio
-        stt,                 # speech -> text (Deepgram)
-    ]
-    if transcript_user is not None:
-        stages.append(transcript_user)      # capture the caller's (restaurant's) words
-    stages += [
-        user_aggregator,
-        llm,                 # Anthropic Claude (our tuned prompt)
-        tts,                 # text -> speech (ElevenLabs Adam)
-        transport.output(),  # audio out to Twilio
-    ]
-    if transcript_assistant is not None:
-        stages.append(transcript_assistant)  # capture what the agent said
-    stages.append(assistant_aggregator)
-
-    pipeline = Pipeline(stages)
+    pipeline = Pipeline(
+        [
+            transport.input(),   # audio in from Twilio
+            stt,                 # speech -> text (Deepgram)
+            user_aggregator,
+            llm,                 # Anthropic Claude (our tuned prompt)
+            tts,                 # text -> speech (ElevenLabs Adam)
+            transport.output(),  # audio out to Twilio
+            assistant_aggregator,
+        ]
+    )
 
     worker = PipelineWorker(
         pipeline,
@@ -166,6 +168,22 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Call ended")
+        # Dump a clean, readable transcript (system prompt excluded) so calls can
+        # be reviewed by filtering the logs for "TRANSCRIPT". pipecat 1.7 has no
+        # TranscriptProcessor, so we read the final LLM context directly.
+        try:
+            for m in context.messages:
+                role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "?")
+                if role == "system":
+                    continue
+                content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                logger.info(f"TRANSCRIPT | {str(role).upper()}: {content}")
+        except Exception as e:
+            logger.warning(f"Transcript dump failed ({e})")
         await worker.cancel()
 
     from pipecat.workers.runner import WorkerRunner
