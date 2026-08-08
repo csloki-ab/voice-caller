@@ -66,9 +66,12 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),  # the ElevenLabs "Adam" voice id
-        model=os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
-        params=ElevenLabsTTSService.InputParams(speed=0.9),
+        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),  # ElevenLabs voice id (swap from Railway, no code change)
+        # turbo sounds noticeably more natural than flash and is still very fast
+        # (~0.1s to first audio); we have plenty of latency headroom for it.
+        model=os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
+        # 1.0 = natural pacing. Tunable from Railway (ELEVENLABS_SPEED) without a code change.
+        params=ElevenLabsTTSService.InputParams(speed=float(os.getenv("ELEVENLABS_SPEED", "1.0"))),
     )
 
     # Seed the conversation with our tuned system prompt for THIS restaurant.
