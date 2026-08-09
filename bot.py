@@ -41,6 +41,60 @@ PROMPT_VARS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "
 with open(os.path.join(os.path.dirname(__file__), "prompt.txt"), "r") as f:
     PROMPT_TEMPLATE = f.read()
 
+import re
+
+# STT keyterm boosting is built PER CALL: base dietary vocabulary + a cuisine-
+# specific dish pack + this restaurant's name + the expected dish names. Without
+# the cuisine pack, 8kHz audio mangled "dal"->"doll", "idli"->"Italy",
+# "Tamarind"->"Cameron" — the LLM never received the real words.
+BASE_DIET_TERMS = [
+    "scallion", "scallions", "allium", "shallot", "leek", "chive",
+    "paneer", "ghee", "tofu", "seitan", "lentil", "chickpea",
+    "vegan", "Jain", "truffle", "asafoetida", "hing",
+]
+
+CUISINE_TERMS = {
+    "indian": [
+        "dal", "daal", "chana", "chana masala", "chole", "rajma",
+        "idli", "dosa", "sambar", "uttapam", "vada", "upma", "poha",
+        "roti", "naan", "paratha", "puri", "thali", "sabzi", "subzi",
+        "aloo", "gobi", "bhindi", "baingan", "biryani", "pulao",
+        "korma", "tadka", "masala", "pakora", "papad",
+    ],
+    "mexican": ["frijoles", "nopales", "rajas", "tlacoyo", "huitlacoche",
+                "quesadilla", "sope", "tamal", "mole", "salsa verde"],
+    "thai": ["pad thai", "pad see ew", "tom yum", "massaman", "larb", "som tum"],
+    "italian": ["marinara", "pomodoro", "arrabbiata", "aglio", "focaccia", "bruschetta"],
+    "chinese": ["mapo tofu", "chow fun", "lo mein", "congee", "bok choy", "doubanjiang"],
+    "japanese": ["inari", "kappa maki", "agedashi", "shojin", "dashi", "edamame"],
+    "middle eastern": ["falafel", "hummus", "mujadara", "fattoush", "tabbouleh", "shawarma"],
+    "mediterranean": ["falafel", "hummus", "tabbouleh", "baba ganoush", "dolma"],
+    "ethiopian": ["injera", "misir wot", "shiro", "gomen", "atkilt", "berbere"],
+}
+
+
+def build_keyterms(call_ctx: dict, cap: int = 50) -> list:
+    """Build this call's Deepgram keyterm list from the per-call context."""
+    terms = list(BASE_DIET_TERMS)
+    cuisine = (call_ctx.get("cuisine") or "").lower()
+    for key, pack in CUISINE_TERMS.items():
+        if key in cuisine:
+            terms += pack
+    if call_ctx.get("restaurant_name"):
+        terms.append(call_ctx["restaurant_name"])  # the "Tamarind"->"Cameron" fix
+    for dish in re.split(r"[,;/]", call_ctx.get("candidate_dishes") or ""):
+        if dish.strip():
+            terms.append(dish.strip())
+    for w in re.findall(r"[A-Za-z]{4,}", call_ctx.get("call_notes") or ""):
+        if w[0].isupper() and w.lower() not in {"they", "their", "there", "then", "this", "that", "with"}:
+            terms.append(w)  # proper nouns from the note (dish/restaurant names)
+    seen, out = set(), []
+    for t in terms:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out[:cap]
+
 
 def build_system_prompt(call_ctx: dict) -> str:
     """Substitute {{var}} placeholders in the tuned prompt with this call's context."""
@@ -74,20 +128,19 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     # aren't accepted by this SDK build, fall back to the plain service so a
     # call never fails to start over an STT config detail.
     _dg_key = os.getenv("DEEPGRAM_API_KEY")
-    # The dietary vocabulary to boost so 8kHz audio doesn't mangle it (plain terms).
-    DIET_TERMS = [
-        "scallion", "scallions", "allium", "shallot", "leek", "chive",
-        "paneer", "ghee", "tofu", "seitan", "lentil", "chickpea",
-        "vegan", "Jain", "truffle", "asafoetida", "hing",
-    ]
-    # nova-3 (default; lower WER incl. 8kHz) boosts via keyterm prompting (plain
-    # terms). nova-2* uses keywords with ":N" intensities. Passing the wrong one
-    # for the model makes Deepgram reject the connection, so branch on the model.
+    # Boost THIS call's vocabulary: dietary terms + cuisine dish pack + the
+    # restaurant's name + expected dishes (build_keyterms above). Without the
+    # cuisine pack, 8kHz audio mangled dal->doll, idli->Italy, Tamarind->Cameron.
+    _dg_terms = build_keyterms(call_ctx)
+    logger.info(f"Deepgram keyterms ({len(_dg_terms)}): {_dg_terms}")
+    # nova-3 (default; lower WER incl. 8kHz) boosts via keyterm prompting. nova-2*
+    # uses keywords with ":N" intensities. Passing the wrong one for the model
+    # makes Deepgram reject the connection, so branch on the model.
     _dg_model = os.getenv("DEEPGRAM_MODEL", "nova-3-general")
     if _dg_model.startswith("nova-3"):
-        _dg_boost = {"keyterm": DIET_TERMS}
+        _dg_boost = {"keyterm": _dg_terms}
     else:
-        _dg_boost = {"keywords": [f"{t}:2" for t in DIET_TERMS]}
+        _dg_boost = {"keywords": [f"{t}:2" for t in _dg_terms]}
     try:
         # pipecat ships its own LiveOptions compat wrapper; the deepgram SDK no
         # longer exports LiveOptions at top level (that import silently fell back
@@ -140,23 +193,51 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     try:
         from pipecat.turns.user_turn_strategies import UserTurnStrategies
         from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
-        from pipecat.turns.user_mute import FirstSpeechUserMuteStrategy
         from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+        from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
+        from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame, Frame
         from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
         from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
+        class FirstNSpeechesUserMuteStrategy(BaseUserMuteStrategy):
+            """Mute the user while the bot speaks, for its first N utterances.
+
+            pipecat's built-in FirstSpeech mutes only the greeting; the PURPOSE
+            line (utterance #2) was left exposed, and the bot's own voice echoing
+            off the restaurant's speakerphone got transcribed and 'interrupted'
+            it. Muting the first two utterances covers greeting + purpose, while
+            still letting the callee's 'Hello?'/'Yes?' through (bot is silent then)."""
+
+            def __init__(self, n: int = 2):
+                super().__init__()
+                self._n = n
+                self._completed = 0
+                self._bot_speaking = False
+
+            async def process_frame(self, frame: "Frame") -> bool:
+                await super().process_frame(frame)
+                if isinstance(frame, BotStartedSpeakingFrame):
+                    self._bot_speaking = True
+                elif isinstance(frame, BotStoppedSpeakingFrame):
+                    self._bot_speaking = False
+                    self._completed += 1
+                return self._bot_speaking and self._completed < self._n
+
         user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
-            start=[MinWordsUserTurnStartStrategy(min_words=3)],
-            # Smart-turn decides when the caller is done. Its default max-silence
-            # fallback is 3s — so a clipped answer misread as "incomplete" makes the
-            # bot sit silent up to 3s (reads as terrible lag). 1.5s halves that
-            # worst case while still letting people finish a list.
+            # Interrupt the bot only on a FINALIZED (not interim) utterance of
+            # >=5 words. The old bar (3 interim words) fired on echo fragments of
+            # the bot's OWN speech and on brief noise — the "cut off for no reason"
+            # problem. When the bot is silent this drops to 1 word, so normal
+            # turn-taking speed is unaffected.
+            start=[MinWordsUserTurnStartStrategy(min_words=5, use_interim=False)],
+            # Smart-turn's default 3s max-silence fallback makes the bot sit silent
+            # on a clipped answer; 1.5s halves that while still letting lists finish.
             stop=[TurnAnalyzerUserTurnStopStrategy(
                 turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=1.5))
             )],
         )
-        user_params_kwargs["user_mute_strategies"] = [FirstSpeechUserMuteStrategy()]
-        logger.info("Barge-in tuning active: MinWords(3) + FirstSpeechMute + SmartTurn(1.5s)")
+        user_params_kwargs["user_mute_strategies"] = [FirstNSpeechesUserMuteStrategy(n=2)]
+        logger.info("Barge-in tuning active: MinWords(5, final-only) + FirstNSpeechMute(2) + SmartTurn(1.5s)")
     except Exception as e:
         logger.warning(f"Turn-taking strategies unavailable ({e}); using pipecat defaults")
 
