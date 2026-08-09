@@ -56,13 +56,17 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
 
     llm = AnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
-        # Haiku 4.5 = the latency sweet spot for real-time voice (~0.4s to first
-        # token). Sonnet's ~2s first-token made calls feel sluggish; Opus is worse.
+        # Haiku 4.5 = the latency sweet spot for real-time voice (~0.4s TTFB).
         model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
-        # Cache the ~7.7k-token system prompt so it isn't reprocessed every turn
-        # (0.1x input cost after turn 1 + faster TTFT). ~3-min calls fit the 5-min TTL.
         params=AnthropicLLMService.InputParams(enable_prompt_caching=True),
+        # If a request hangs, retry once at 5s instead of leaving the bot silent
+        # forever (silent-bot dead air is a real cause of the restaurant hanging up).
+        retry_on_timeout=True,
     )
+
+    @llm.event_handler("on_completion_timeout")
+    async def on_completion_timeout(service):
+        logger.warning("LLM completion timed out — retried")
 
     # STT: default to a telephony-tuned Deepgram model and BOOST the dietary
     # vocabulary so 8kHz phone audio doesn't mangle key words (e.g. hearing
@@ -110,8 +114,13 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # turbo sounds noticeably more natural than flash and is still very fast
         # (~0.1s to first audio); we have plenty of latency headroom for it.
         model=os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
-        # 1.0 = natural pacing. Tunable from Railway (ELEVENLABS_SPEED) without a code change.
-        params=ElevenLabsTTSService.InputParams(speed=float(os.getenv("ELEVENLABS_SPEED", "1.0"))),
+        # 1.0 = natural pacing. Slightly LOWER stability = more natural human
+        # variation on a phone line (too-high stability reads as flat/robotic).
+        params=ElevenLabsTTSService.InputParams(
+            speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
+            stability=0.45,
+            similarity_boost=0.75,
+        ),
     )
 
     # Turn-taking / barge-in tuning. pipecat's DEFAULT lets ANY 200ms of speech
@@ -132,12 +141,22 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         from pipecat.turns.user_turn_strategies import UserTurnStrategies
         from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
         from pipecat.turns.user_mute import FirstSpeechUserMuteStrategy
+        from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+        from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 
         user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
             start=[MinWordsUserTurnStartStrategy(min_words=3)],
+            # Smart-turn decides when the caller is done. Its default max-silence
+            # fallback is 3s — so a clipped answer misread as "incomplete" makes the
+            # bot sit silent up to 3s (reads as terrible lag). 1.5s halves that
+            # worst case while still letting people finish a list.
+            stop=[TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=1.5))
+            )],
         )
         user_params_kwargs["user_mute_strategies"] = [FirstSpeechUserMuteStrategy()]
-        logger.info("Barge-in tuning active: MinWords(3) + FirstSpeechMute")
+        logger.info("Barge-in tuning active: MinWords(3) + FirstSpeechMute + SmartTurn(1.5s)")
     except Exception as e:
         logger.warning(f"Turn-taking strategies unavailable ({e}); using pipecat defaults")
 

@@ -53,6 +53,29 @@ if _missing:
 
 app = FastAPI()
 
+# Import the bot + pipecat runner eagerly at boot (they were lazy-imported inside
+# the websocket handler, so the first call paid the whole import chain mid-call).
+from pipecat.runner.types import WebSocketRunnerArguments  # noqa: E402
+from bot import bot  # noqa: E402
+
+
+@app.on_event("startup")
+async def _preload_models():
+    """Warm the ONNX models (Silero VAD + smart-turn) into memory/page-cache at
+    boot. Otherwise the FIRST call spends 1-2s loading them AFTER the restaurant
+    has already answered — the 2.3s cold-start we measured. Throwaway instances;
+    we build fresh per-call ones (they hold per-stream state) but the files and
+    onnxruntime are now warm, so per-call construction is ~100-200ms."""
+    try:
+        from pipecat.audio.vad.silero import SileroVADAnalyzer
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+
+        SileroVADAnalyzer()
+        LocalSmartTurnAnalyzerV3()
+        logger.info("Preloaded Silero VAD + smart-turn models at boot")
+    except Exception as e:
+        logger.warning(f"Model preload skipped ({e})")
+
 
 @app.post("/dialout", response_model=DialoutResponse)
 async def handle_dialout_request(request: Request) -> DialoutResponse:
@@ -114,10 +137,6 @@ async def websocket_endpoint(websocket: WebSocket):
     Args:
         websocket (WebSocket): FastAPI WebSocket connection from Twilio.
     """
-    from pipecat.runner.types import WebSocketRunnerArguments
-
-    from bot import bot
-
     await websocket.accept()
     logger.info("WebSocket connection accepted for outbound call")
 
