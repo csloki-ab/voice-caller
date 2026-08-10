@@ -41,6 +41,7 @@ PROMPT_VARS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "
 with open(os.path.join(os.path.dirname(__file__), "prompt.txt"), "r") as f:
     PROMPT_TEMPLATE = f.read()
 
+import json
 import re
 
 # STT keyterm boosting is built PER CALL: base dietary vocabulary + a cuisine-
@@ -161,18 +162,38 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         logger.warning(f"Deepgram enhanced options unavailable ({e}); using defaults")
         stt = DeepgramSTTService(api_key=_dg_key)
 
+    # Pick the voice for THIS call's cuisine. ELEVENLABS_VOICE_MAP is a JSON map
+    # like {"indian": "<id>", "default": "<id>"} — an Indian-English voice for an
+    # Indian restaurant both sounds natural in context AND pronounces the dish
+    # names (chana, dal, roti) correctly. Falls back to ELEVENLABS_VOICE_ID.
+    _voice_map = {}
+    try:
+        _voice_map = json.loads(os.getenv("ELEVENLABS_VOICE_MAP", "{}")) or {}
+    except Exception as e:
+        logger.warning(f"Bad ELEVENLABS_VOICE_MAP ({e}); ignoring")
+    _cuisine = (call_ctx.get("cuisine") or "").lower()
+    _voice_id = (
+        next((v for k, v in _voice_map.items() if k != "default" and k in _cuisine), None)
+        or _voice_map.get("default")
+        or os.getenv("ELEVENLABS_VOICE_ID")
+    )
+    logger.info(f"TTS voice_id={_voice_id} (cuisine={_cuisine!r})")
+
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id=os.getenv("ELEVENLABS_VOICE_ID"),  # ElevenLabs voice id (swap from Railway, no code change)
-        # turbo sounds noticeably more natural than flash and is still very fast
-        # (~0.1s to first audio); we have plenty of latency headroom for it.
-        model=os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5"),
-        # 1.0 = natural pacing. Slightly LOWER stability = more natural human
-        # variation on a phone line (too-high stability reads as flat/robotic).
+        voice_id=_voice_id,
+        # multilingual_v2 = ElevenLabs' most natural realtime model and it renders
+        # non-English (Hindi-origin) dish words far better than the turbo/flash
+        # English path — the pronunciation fix. Slightly higher TTFB, but we have
+        # headroom. Override per-need with ELEVENLABS_MODEL.
+        model=os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+        # Lower stability + non-zero style = less flat/robotic on a phone line
+        # (style defaulted to 0 before = maximally flat). Tunable from Railway.
         params=ElevenLabsTTSService.InputParams(
             speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
-            stability=0.45,
-            similarity_boost=0.75,
+            stability=float(os.getenv("ELEVENLABS_STABILITY", "0.40")),
+            similarity_boost=float(os.getenv("ELEVENLABS_SIMILARITY", "0.75")),
+            style=float(os.getenv("ELEVENLABS_STYLE", "0.35")),
         ),
     )
 
