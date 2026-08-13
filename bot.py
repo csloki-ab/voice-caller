@@ -235,6 +235,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         from pipecat.turns.user_turn_strategies import UserTurnStrategies
         from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
         from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+        from pipecat.turns.user_stop.deferred_user_turn_stop_strategy import deferred
+        from pipecat.turns.user_stop.llm_turn_completion_user_turn_stop_strategy import (
+            LLMTurnCompletionUserTurnStopStrategy,
+        )
+        from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
         from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
         from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame, Frame
         from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -265,22 +270,53 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 return self._bot_speaking and self._completed < self._n
 
         user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
-            # Interrupt the bot only on a FINALIZED (not interim) utterance of
-            # >=5 words. The old bar (3 interim words) fired on echo fragments of
-            # the bot's OWN speech and on brief noise — the "cut off for no reason"
-            # problem. When the bot is silent this drops to 1 word, so normal
-            # turn-taking speed is unaffected.
-            start=[MinWordsUserTurnStartStrategy(min_words=5, use_interim=False)],
-            # Smart-turn's default 3s max-silence fallback makes the bot sit silent
-            # on a clipped answer; 1.5s halves that while still letting lists finish.
-            stop=[TurnAnalyzerUserTurnStopStrategy(
-                turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=1.5))
-            )],
+            # Bar to INTERRUPT the bot (only applies while the bot is speaking;
+            # when it's silent the bar is 1 word, so normal pace is unaffected).
+            # Was 5 FINALIZED words — far too high: a finalized Deepgram transcript
+            # only lands on endpointing, so a manager trying to reclaim the floor
+            # got steamrolled for seconds. 3 words on INTERIMS reacts in ~300-600ms
+            # while still filtering backchannels ("yeah", "uh-huh") and echo blips.
+            start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
+            # END-OF-TURN. Two-stage, and the ordering matters:
+            #   1. smart-turn v3 detects a pause and TRIGGERS inference, but
+            #      deferred(...) suppresses its finalization, so an acoustic
+            #      mis-prediction alone can no longer end the caller's turn.
+            #   2. the LLM reads the actual words and decides: it prefixes
+            #      complete/incomplete markers, and on "incomplete" the response
+            #      is SUPPRESSED entirely (no barge-in) until they really finish.
+            # This is the fix for talking over a restaurant reading a dish list:
+            # "We have the fettuccine Alfredo," is obviously unfinished in TEXT
+            # even when it sounds finished acoustically.
+            # stop_secs is the ceiling on how long we trust "not done yet" before
+            # force-ending the turn. It was 1.5s, which OVERRODE the model on any
+            # normal 1.5s+ pause between menu items — the actual barge-in cause.
+            # 4.0 covers menu-checking pauses; stays under the 5s controller
+            # watchdog. It costs NO latency on finished answers (those end ~0.2s
+            # after VAD stop via the model, never via this fallback).
+            stop=[
+                deferred(TurnAnalyzerUserTurnStopStrategy(
+                    turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=4.0))
+                )),
+                LLMTurnCompletionUserTurnStopStrategy(
+                    config=UserTurnCompletionConfig(
+                        # If they're mid-list and go quiet, wait this long before
+                        # gently nudging ("go ahead, I'm listening") instead of
+                        # barging in with analysis.
+                        incomplete_short_timeout=6.0,
+                        incomplete_long_timeout=12.0,
+                    )
+                ),
+            ],
         )
         user_params_kwargs["user_mute_strategies"] = [FirstNSpeechesUserMuteStrategy(n=2)]
-        logger.info("Barge-in tuning active: MinWords(5, final-only) + FirstNSpeechMute(2) + SmartTurn(1.5s)")
+        logger.info(
+            "Turn-taking active: MinWords(3, interim) + FirstNSpeechMute(2) + "
+            "deferred SmartTurn(4.0s) + LLM turn-completion gating"
+        )
     except Exception as e:
-        logger.warning(f"Turn-taking strategies unavailable ({e}); using pipecat defaults")
+        # Loud, not quiet: silently falling back to defaults is how we shipped
+        # twitchy turn-taking before without noticing.
+        logger.error(f"TURN-TAKING CONFIG FAILED ({e}) — running pipecat DEFAULTS (expect barge-in)")
 
     # Seed the conversation with our tuned system prompt for THIS restaurant.
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])

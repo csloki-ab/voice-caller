@@ -153,9 +153,11 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
         method="POST",
         record=record,
         recording_channels="dual",
-        # Hard backstop: end the call after 6 min so a silent/voicemail line
-        # can't sit open running up cost. Normal calls finish well under this.
-        time_limit=360,
+        # Hard backstop so a silent/voicemail line can't sit open running up cost.
+        # Was 360s (6 min) but a patient real call — restaurant reading a full
+        # curated list slowly — hit that cap mid-conversation and got cut off.
+        # 600s (10 min) leaves generous room; genuine calls still finish under it.
+        time_limit=int(os.getenv("CALL_TIME_LIMIT", "600")),
     )
 
     return TwilioCallResult(call_sid=call.sid, to_number=to_number)
