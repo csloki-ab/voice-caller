@@ -213,6 +213,20 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             sample_rate=8000,
         )
 
+    def _build_cartesia_tts():
+        # Cartesia Sonic — the other phone-native engine (fastest time-to-first-audio,
+        # which matters because uniform/laggy response timing is a bigger "this is a bot"
+        # tell than voice timbre). Needs CARTESIA_API_KEY + a voice id from their library.
+        from pipecat.services.cartesia.tts import CartesiaTTSService
+        return CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSService.Settings(
+                voice=os.getenv("CARTESIA_VOICE_ID"),
+                model=os.getenv("CARTESIA_MODEL", "sonic-3.5"),
+            ),
+            sample_rate=8000,
+        )
+
     def _build_rime_tts():
         from pipecat.services.rime.tts import RimeTTSService
         return RimeTTSService(
@@ -223,7 +237,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         )
 
     _tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs").lower()
-    _tts_builders = {"deepgram": _build_deepgram_tts, "rime": _build_rime_tts}
+    _tts_builders = {
+        "deepgram": _build_deepgram_tts,
+        "rime": _build_rime_tts,
+        "cartesia": _build_cartesia_tts,
+    }
     try:
         tts = _tts_builders.get(_tts_provider, _build_elevenlabs_tts)()
         logger.info(f"TTS provider: {_tts_provider}")
