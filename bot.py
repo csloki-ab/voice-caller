@@ -113,7 +113,21 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         api_key=os.getenv("ANTHROPIC_API_KEY"),
         # Haiku 4.5 = the latency sweet spot for real-time voice (~0.4s TTFB).
         model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
-        params=AnthropicLLMService.InputParams(enable_prompt_caching=True),
+        # The dietary prompt MUST be passed as system_instruction, NOT as a system
+        # message in LLMContext. The LLM turn-completion strategy appends its own
+        # marker instructions by recomposing settings.system_instruction from the
+        # service's BASE instruction; if the base is empty (prompt only in context)
+        # the composed system becomes the marker instructions ALONE, and the
+        # Anthropic adapter then DISCARDS the context's system message entirely
+        # (base_llm_adapter._resolve_system_instruction: system_instruction wins).
+        # Net effect of getting this wrong: the bot calls a restaurant with no diet
+        # prompt at all — a generic assistant. Verified against the 1.7.0 source.
+        settings=AnthropicLLMService.Settings(
+            system_instruction=system_prompt,
+            # Must live HERE, not in params=: the constructor ignores params
+            # entirely when settings is provided (anthropic/llm.py "if not settings").
+            enable_prompt_caching=True,
+        ),
         # If a request hangs, retry once at 5s instead of leaving the bot silent
         # forever (silent-bot dead air is a real cause of the restaurant hanging up).
         retry_on_timeout=True,
@@ -318,8 +332,10 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # twitchy turn-taking before without noticing.
         logger.error(f"TURN-TAKING CONFIG FAILED ({e}) — running pipecat DEFAULTS (expect barge-in)")
 
-    # Seed the conversation with our tuned system prompt for THIS restaurant.
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    # NOTE: no system message here on purpose — the tuned prompt is passed to the
+    # LLM service as system_instruction above (see the comment there). Putting it
+    # in the context too would just get discarded by the Anthropic adapter.
+    context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(**user_params_kwargs),
@@ -369,6 +385,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     content = " ".join(
                         p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
                     )
+                # Strip the LLM turn-completion markers (never spoken aloud, but
+                # they persist in context, e.g. "✓ Hi there!" / a bare "○").
+                content = str(content).lstrip("✓○◐ ").strip()
+                if not content:
+                    continue  # bare incomplete-marker turn — nothing was said
                 logger.info(f"TRANSCRIPT | {str(role).upper()}: {content}")
         except Exception as e:
             logger.warning(f"Transcript dump failed ({e})")

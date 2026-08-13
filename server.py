@@ -76,6 +76,37 @@ async def _preload_models():
     except Exception as e:
         logger.warning(f"Model preload skipped ({e})")
 
+    # Preflight the turn-taking chain AT BOOT. bot.py wraps this same config in a
+    # try/except and falls back to pipecat defaults on failure — which is exactly
+    # the twitchy barge-in behavior we just fixed. For unattended scheduled calls
+    # we want that failure to surface as a crashed Railway deploy, not as eight
+    # bad live calls to real restaurants. Deliberately NOT caught.
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+    from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+    from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+    from pipecat.turns.user_stop.deferred_user_turn_stop_strategy import deferred
+    from pipecat.turns.user_stop.llm_turn_completion_user_turn_stop_strategy import (
+        LLMTurnCompletionUserTurnStopStrategy,
+    )
+    from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
+    from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+    from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3 as _STA
+
+    UserTurnStrategies(
+        start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
+        stop=[
+            deferred(TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=_STA(params=SmartTurnParams(stop_secs=4.0))
+            )),
+            LLMTurnCompletionUserTurnStopStrategy(
+                config=UserTurnCompletionConfig(
+                    incomplete_short_timeout=6.0, incomplete_long_timeout=12.0
+                )
+            ),
+        ],
+    )
+    logger.info("Turn-taking preflight OK (deferred smart-turn + LLM completion gating)")
+
 
 @app.post("/dialout", response_model=DialoutResponse)
 async def handle_dialout_request(request: Request) -> DialoutResponse:
