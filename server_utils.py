@@ -25,7 +25,9 @@ class DialoutRequest(BaseModel):
     """
 
     to_number: str
-    from_number: str
+    # Optional: defaults to the server's TWILIO_FROM_NUMBER env in make_twilio_call
+    # so schedulers (the Cloudflare cron) don't have to duplicate the Twilio number.
+    from_number: str = ""
     # Per-call dietary context injected into the tuned prompt (all optional):
     restaurant_name: str = ""
     call_notes: str = ""
@@ -114,7 +116,10 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
         ValueError: If required environment variables are missing.
     """
     to_number = dialout_request.to_number
-    from_number = dialout_request.from_number
+    # Fall back to the server's own Twilio number when the caller didn't supply one.
+    from_number = (dialout_request.from_number or os.getenv("TWILIO_FROM_NUMBER") or "").strip()
+    if not from_number:
+        raise ValueError("Missing from_number (and TWILIO_FROM_NUMBER is unset)")
 
     local_server_url = (os.getenv("LOCAL_SERVER_URL") or "").strip().rstrip("/")
     if not local_server_url:
