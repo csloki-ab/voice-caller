@@ -157,7 +157,11 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
         # Was 360s (6 min) but a patient real call — restaurant reading a full
         # curated list slowly — hit that cap mid-conversation and got cut off.
         # 600s (10 min) leaves generous room; genuine calls still finish under it.
-        time_limit=int(os.getenv("CALL_TIME_LIMIT", "600")),
+        # Raised 600 -> 1200: the cap became the BINDING constraint on good calls,
+        # twice. King David's ran a productive build-your-own conversation and was
+        # cut off at exactly 600s mid-discussion; Crossroads hit the old 360s the
+        # same way. A genuinely stuck/voicemail line still can't run past 20 min.
+        time_limit=int(os.getenv("CALL_TIME_LIMIT", "1200")),
     )
 
     return TwilioCallResult(call_sid=call.sid, to_number=to_number)
