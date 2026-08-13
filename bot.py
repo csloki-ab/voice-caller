@@ -162,40 +162,60 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         logger.warning(f"Deepgram enhanced options unavailable ({e}); using defaults")
         stt = DeepgramSTTService(api_key=_dg_key)
 
-    # Pick the voice for THIS call's cuisine. ELEVENLABS_VOICE_MAP is a JSON map
-    # like {"indian": "<id>", "default": "<id>"} — an Indian-English voice for an
-    # Indian restaurant both sounds natural in context AND pronounces the dish
-    # names (chana, dal, roti) correctly. Falls back to ELEVENLABS_VOICE_ID.
-    _voice_map = {}
-    try:
-        _voice_map = json.loads(os.getenv("ELEVENLABS_VOICE_MAP", "{}")) or {}
-    except Exception as e:
-        logger.warning(f"Bad ELEVENLABS_VOICE_MAP ({e}); ignoring")
-    _cuisine = (call_ctx.get("cuisine") or "").lower()
-    _voice_id = (
-        next((v for k, v in _voice_map.items() if k != "default" and k in _cuisine), None)
-        or _voice_map.get("default")
-        or os.getenv("ELEVENLABS_VOICE_ID")
-    )
-    logger.info(f"TTS voice_id={_voice_id} (cuisine={_cuisine!r})")
+    # TTS engine is swappable via TTS_PROVIDER (elevenlabs | deepgram | rime) so
+    # we can A/B whole engines from Railway, no code change. ElevenLabs is a
+    # content/narration engine (reads "AI" on a phone); deepgram (Aura-2) and rime
+    # are purpose-built for phone conversation. Aura-2 reuses our DEEPGRAM_API_KEY.
+    def _build_elevenlabs_tts():
+        # Per-cuisine voice via ELEVENLABS_VOICE_MAP {"indian":"<id>","default":"<id>"}.
+        _voice_map = {}
+        try:
+            _voice_map = json.loads(os.getenv("ELEVENLABS_VOICE_MAP", "{}")) or {}
+        except Exception as e:
+            logger.warning(f"Bad ELEVENLABS_VOICE_MAP ({e}); ignoring")
+        _cuisine = (call_ctx.get("cuisine") or "").lower()
+        _voice_id = (
+            next((v for k, v in _voice_map.items() if k != "default" and k in _cuisine), None)
+            or _voice_map.get("default")
+            or os.getenv("ELEVENLABS_VOICE_ID")
+        )
+        return ElevenLabsTTSService(
+            api_key=os.getenv("ELEVENLABS_API_KEY"),
+            voice_id=_voice_id,
+            model=os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+            params=ElevenLabsTTSService.InputParams(
+                speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
+                stability=float(os.getenv("ELEVENLABS_STABILITY", "0.40")),
+                similarity_boost=float(os.getenv("ELEVENLABS_SIMILARITY", "0.75")),
+                style=float(os.getenv("ELEVENLABS_STYLE", "0.35")),
+            ),
+        )
 
-    tts = ElevenLabsTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id=_voice_id,
-        # multilingual_v2 = ElevenLabs' most natural realtime model and it renders
-        # non-English (Hindi-origin) dish words far better than the turbo/flash
-        # English path — the pronunciation fix. Slightly higher TTFB, but we have
-        # headroom. Override per-need with ELEVENLABS_MODEL.
-        model=os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
-        # Lower stability + non-zero style = less flat/robotic on a phone line
-        # (style defaulted to 0 before = maximally flat). Tunable from Railway.
-        params=ElevenLabsTTSService.InputParams(
-            speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
-            stability=float(os.getenv("ELEVENLABS_STABILITY", "0.40")),
-            similarity_boost=float(os.getenv("ELEVENLABS_SIMILARITY", "0.75")),
-            style=float(os.getenv("ELEVENLABS_STYLE", "0.35")),
-        ),
-    )
+    def _build_deepgram_tts():
+        from pipecat.services.deepgram.tts import DeepgramTTSService
+        return DeepgramTTSService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),  # SAME key as our STT — no new signup
+            voice=os.getenv("DEEPGRAM_VOICE", "aura-2-thalia-en"),
+            sample_rate=8000,
+        )
+
+    def _build_rime_tts():
+        from pipecat.services.rime.tts import RimeTTSService
+        return RimeTTSService(
+            api_key=os.getenv("RIME_API_KEY"),
+            voice_id=os.getenv("RIME_VOICE_ID", "luna"),
+            model=os.getenv("RIME_MODEL", "arcana"),
+            sample_rate=8000,
+        )
+
+    _tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs").lower()
+    _tts_builders = {"deepgram": _build_deepgram_tts, "rime": _build_rime_tts}
+    try:
+        tts = _tts_builders.get(_tts_provider, _build_elevenlabs_tts)()
+        logger.info(f"TTS provider: {_tts_provider}")
+    except Exception as e:
+        logger.warning(f"TTS provider {_tts_provider!r} failed ({e}); falling back to ElevenLabs")
+        tts = _build_elevenlabs_tts()
 
     # Turn-taking / barge-in tuning. pipecat's DEFAULT lets ANY 200ms of speech
     # (a breath, a one-word overlap, kitchen noise) instantly interrupt the bot,
