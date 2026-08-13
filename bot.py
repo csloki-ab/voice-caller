@@ -271,7 +271,21 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         from pipecat.turns.user_stop.llm_turn_completion_user_turn_stop_strategy import (
             LLMTurnCompletionUserTurnStopStrategy,
         )
-        from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
+        from pipecat.turns.user_turn_completion_mixin import (
+            UserTurnCompletionConfig,
+            USER_TURN_COMPLETION_INSTRUCTIONS,
+        )
+
+        # The callee speaks first (we're outbound), so their pickup greeting must
+        # ALWAYS be treated as a complete turn — otherwise the gate suppresses our
+        # greeting and the restaurant hears silence and hangs up.
+        _OPENING_MARKER_RULE = (
+            "\n\nPHONE-CALL OPENING EXCEPTION: You placed this call. The callee's FIRST "
+            "utterance after pickup ('Hello?', 'Yes?', a business greeting, or just the "
+            "restaurant's name) is ALWAYS a complete turn: respond with the complete "
+            "marker and your greeting immediately. Never output an incomplete marker "
+            "before you have spoken your first greeting."
+        )
         from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
         from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame, Frame
         from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -286,11 +300,16 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             it. Muting the first two utterances covers greeting + purpose, while
             still letting the callee's 'Hello?'/'Yes?' through (bot is silent then)."""
 
-            def __init__(self, n: int = 2):
+            def __init__(self, n: int = 2, turn_analyzer=None,
+                         patient_stop_secs: float = 4.0):
                 super().__init__()
                 self._n = n
                 self._completed = 0
                 self._bot_speaking = False
+                # The live smart-turn analyzer; we raise its silence threshold
+                # once the call is actually underway (see below).
+                self._turn_analyzer = turn_analyzer
+                self._patient_stop_secs = patient_stop_secs
 
             async def process_frame(self, frame: "Frame") -> bool:
                 await super().process_frame(frame)
@@ -299,7 +318,42 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 elif isinstance(frame, BotStoppedSpeakingFrame):
                     self._bot_speaking = False
                     self._completed += 1
+                    # PHASE SWITCH — the whole point of this hook.
+                    # A single stop_secs can't serve both ends of a call:
+                    #   opening: they say "Hello?" and a busy restaurant hangs up
+                    #            after ~3s of dead air, so we must answer FAST;
+                    #   mid-call: they read a dish list with 2-3s gaps between
+                    #            items, so we must wait PATIENTLY.
+                    # We therefore open snappy and, as soon as the bot has
+                    # completed its first utterance (i.e. the conversation is
+                    # really underway and lists become possible), raise stop_secs
+                    # to the patient value. Mutating the params object works
+                    # because base_smart_turn reads params.stop_secs per call.
+                    # NOTE: base_smart_turn caches `_stop_ms = stop_secs * 1000`
+                    # in __init__ and compares against THAT (base_smart_turn.py
+                    # :70 and :132) — mutating params.stop_secs alone is a no-op.
+                    # We must set the cached threshold too. Verified against the
+                    # 1.7.0 source; keep both in sync if you touch this.
+                    if self._completed == 1 and self._turn_analyzer is not None:
+                        try:
+                            self._turn_analyzer._params.stop_secs = self._patient_stop_secs
+                            self._turn_analyzer._stop_ms = self._patient_stop_secs * 1000
+                            logger.info(
+                                f"Turn-taking: switched to patient mode "
+                                f"(stop_secs={self._patient_stop_secs})"
+                            )
+                        except Exception as e:
+                            # Never let a tuning tweak kill a live call.
+                            logger.warning(f"Patient-mode switch failed ({e}); staying snappy")
                 return self._bot_speaking and self._completed < self._n
+
+        # Snappy while the call opens, patient once it's underway (flipped by the
+        # mute strategy below). Both ends env-tunable so we can retune without a
+        # code change if live calls show we're still too eager or too slow.
+        _opening_stop_secs = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
+        _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+        _turn_params = SmartTurnParams(stop_secs=_opening_stop_secs)
+        _turn_analyzer = LocalSmartTurnAnalyzerV3(params=_turn_params)
 
         user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
             # Bar to INTERRUPT the bot (only applies while the bot is speaking;
@@ -325,12 +379,25 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             # 4.0 covers menu-checking pauses; stays under the 5s controller
             # watchdog. It costs NO latency on finished answers (those end ~0.2s
             # after VAD stop via the model, never via this fallback).
+            # NOTE: stop_secs STARTS at the snappy opening value and is raised to
+            # the patient value by FirstNSpeechesUserMuteStrategy after the bot's
+            # first utterance. Opening at 4.0 made the bot sit silent for up to 4s
+            # on "Hello?" — restaurants hung up before it ever spoke.
             stop=[
                 deferred(TurnAnalyzerUserTurnStopStrategy(
-                    turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=4.0))
+                    turn_analyzer=_turn_analyzer
                 )),
                 LLMTurnCompletionUserTurnStopStrategy(
                     config=UserTurnCompletionConfig(
+                        # SECOND dead-air source, independent of stop_secs: if the
+                        # LLM marks the callee's FIRST "Hello?" as incomplete, the
+                        # response is suppressed entirely and nothing is spoken for
+                        # 6s (○) or 12s (◐) — a guaranteed hangup. pipecat's default
+                        # marker rules are written for mid-conversation ("has the
+                        # user answered your question?"), which a bare "Hello?"
+                        # literally fails. We append an opening exception. NOTE the
+                        # config replaces the defaults wholesale, so we concatenate.
+                        instructions=USER_TURN_COMPLETION_INSTRUCTIONS + _OPENING_MARKER_RULE,
                         # If they're mid-list and go quiet, wait this long before
                         # gently nudging ("go ahead, I'm listening") instead of
                         # barging in with analysis.
@@ -340,7 +407,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 ),
             ],
         )
-        user_params_kwargs["user_mute_strategies"] = [FirstNSpeechesUserMuteStrategy(n=2)]
+        user_params_kwargs["user_mute_strategies"] = [
+            FirstNSpeechesUserMuteStrategy(
+                n=2, turn_analyzer=_turn_analyzer, patient_stop_secs=_patient_stop_secs
+            )
+        ]
         logger.info(
             "Turn-taking active: MinWords(3, interim) + FirstNSpeechMute(2) + "
             "deferred SmartTurn(4.0s) + LLM turn-completion gating"
@@ -405,9 +476,16 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     )
                 # Strip the LLM turn-completion markers (never spoken aloud, but
                 # they persist in context, e.g. "✓ Hi there!" / a bare "○").
-                content = str(content).lstrip("✓○◐ ").strip()
+                raw = str(content)
+                content = raw.lstrip("✓○◐ ").strip()
                 if not content:
-                    continue  # bare incomplete-marker turn — nothing was said
+                    # A bare incomplete marker = the LLM SUPPRESSED this response and
+                    # the caller heard SILENCE. Previously we skipped these, which made
+                    # opening dead-air invisible in the transcript (a call showing only
+                    # 'USER: Hello?' looked like an instant hangup). Log it explicitly.
+                    marker = raw.strip()[:1]
+                    logger.info(f"TRANSCRIPT | {str(role).upper()}: [suppressed {marker} — bot stayed silent]")
+                    continue
                 logger.info(f"TRANSCRIPT | {str(role).upper()}: {content}")
         except Exception as e:
             logger.warning(f"Transcript dump failed ({e})")

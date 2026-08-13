@@ -92,11 +92,26 @@ async def _preload_models():
     from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
     from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3 as _STA
 
+    # Parse the SAME env vars bot.py does, UNCAUGHT: a malformed Railway value
+    # would otherwise be swallowed by bot.py's per-call try/except and silently
+    # drop every live call to pipecat's default (twitchy) turn-taking.
+    _opening = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
+    _patient = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+
+    # bot.py flips the analyzer from snappy->patient mid-call by writing these
+    # PRIVATE attrs (no public API exists in 1.7.0). If a pipecat upgrade renames
+    # them the flip becomes a silent no-op, so assert them at deploy time.
+    _sta_probe = _STA(params=SmartTurnParams(stop_secs=_opening))
+    assert hasattr(_sta_probe, "_stop_ms") and hasattr(_sta_probe, "_params"), (
+        "smart-turn internals renamed — bot.py's snappy->patient switch would silently no-op"
+    )
+    assert _sta_probe._stop_ms == _opening * 1000, "smart-turn no longer caches _stop_ms as expected"
+
     UserTurnStrategies(
         start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
         stop=[
             deferred(TurnAnalyzerUserTurnStopStrategy(
-                turn_analyzer=_STA(params=SmartTurnParams(stop_secs=4.0))
+                turn_analyzer=_STA(params=SmartTurnParams(stop_secs=_patient))
             )),
             LLMTurnCompletionUserTurnStopStrategy(
                 config=UserTurnCompletionConfig(
