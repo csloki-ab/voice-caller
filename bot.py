@@ -449,6 +449,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     # 1.7.0 source; keep both in sync if you touch this.
                     if self._completed == 1 and self._turn_analyzer is not None:
                         try:
+                            # Adaptive analyzer: the value that matters is the
+                            # one applied to a CONFIDENTLY-incomplete prediction.
+                            # Each prediction rewrites _stop_ms, so setting only
+                            # that would be overwritten on the very next pause.
+                            self._turn_analyzer._incomplete_stop_secs = self._patient_stop_secs
                             self._turn_analyzer._params.stop_secs = self._patient_stop_secs
                             self._turn_analyzer._stop_ms = self._patient_stop_secs * 1000
                             logger.info(
@@ -465,8 +470,58 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # code change if live calls show we're still too eager or too slow.
         _opening_stop_secs = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
         _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+        # A SINGLE flat stop_secs is what made the bot feel robotic. smart-turn
+        # runs its model ONCE per pause and never re-runs it, so whenever it
+        # predicted "not done" (common on 8kHz narrowband) nothing could end the
+        # turn until the full fallback expired — ~4.2s of dead air, on top of
+        # LLM+TTS. Calls alternated ~2s and ~6s gaps; that machine-uniform
+        # bimodal rhythm reads as a bot no matter how good the voice is. The bot
+        # was literally saying "I'm still here" into silence it created.
+        #
+        # Fix: adapt the fallback to the model's OWN confidence, which is
+        # recomputed on every pause, so this is per-pause adaptive for free.
+        #   p >= complete_threshold : they're done -> answer now
+        #   sure_floor <= p < thresh: probably done, narrowband just unsure
+        #                             -> SHORT fallback (~1.2s)
+        #   p <  sure_floor         : genuinely mid-sentence ("...and we have,
+        #                             um—") -> keep the FULL patient fallback
+        # Threshold drops 0.5 -> 0.35 to offset v3's narrowband pessimism.
+        class AdaptiveStopSmartTurnV3(LocalSmartTurnAnalyzerV3):
+            def __init__(self, *, complete_threshold, sure_floor,
+                         unsure_stop_secs, incomplete_stop_secs, **kwargs):
+                super().__init__(**kwargs)
+                self._complete_threshold = complete_threshold
+                self._sure_floor = sure_floor
+                self._unsure_stop_secs = unsure_stop_secs
+                self._incomplete_stop_secs = incomplete_stop_secs
+
+            def _predict_endpoint(self, audio_array):
+                result = super()._predict_endpoint(audio_array)
+                p = result.get("probability", 0.0)
+                if p >= self._complete_threshold:
+                    result["prediction"] = 1
+                else:
+                    result["prediction"] = 0
+                    secs = (
+                        self._unsure_stop_secs
+                        if p >= self._sure_floor
+                        else self._incomplete_stop_secs
+                    )
+                    # Each prediction rewrites the live threshold the silence
+                    # counter compares against (base_smart_turn caches it).
+                    self._stop_ms = secs * 1000
+                return result
+
         _turn_params = SmartTurnParams(stop_secs=_opening_stop_secs)
-        _turn_analyzer = LocalSmartTurnAnalyzerV3(params=_turn_params)
+        _turn_analyzer = AdaptiveStopSmartTurnV3(
+            params=_turn_params,
+            complete_threshold=float(os.getenv("SMART_TURN_COMPLETE_THRESHOLD", "0.35")),
+            sure_floor=float(os.getenv("SMART_TURN_SURE_FLOOR", "0.15")),
+            unsure_stop_secs=float(os.getenv("SMART_TURN_UNSURE_STOP_SECS", "1.2")),
+            # Stay snappy through the opening; the mute strategy raises this to
+            # the patient value once the conversation is actually underway.
+            incomplete_stop_secs=_opening_stop_secs,
+        )
 
         user_params_kwargs["user_turn_strategies"] = UserTurnStrategies(
             # Bar to INTERRUPT the bot (only applies while the bot is speaking;
