@@ -115,9 +115,12 @@ async def _preload_models():
     # to fall back on), so fail the deploy if either can't be constructed.
     from bot import EchoGate, BotTextTap, FailsafeAnthropicLLMService  # noqa: F401
     from collections import deque as _deque
+    import time as _time
 
     _probe = _deque(maxlen=4)
-    _probe.append((0.0, "is this the restaurant"))
+    # NOTE: must be a CURRENT timestamp — EchoGate only considers bot text from
+    # the last 12s, so a 0.0 timestamp reads as ancient and matches nothing.
+    _probe.append((_time.time(), "is this the restaurant"))
     assert EchoGate(_probe)._is_echo("is this the restaurant"), "EchoGate no longer detects echo"
     assert not EchoGate(_probe)._is_echo("we have chana masala and dal"), "EchoGate too aggressive"
 
