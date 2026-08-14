@@ -1,8 +1,9 @@
 #
 # voice-caller — Pipecat outbound dietary-inquiry bot
 # Based on pipecat-examples/twilio-chatbot/outbound, customized to:
-#   - use ElevenLabs (the "Adam" voice) for TTS
-#   - use Anthropic Claude (Sonnet) for the LLM
+#   - swappable TTS via TTS_PROVIDER (deepgram Aura-2 is current; elevenlabs |
+#     rime | cartesia also wired)
+#   - use Anthropic Claude (Haiku 4.5) for the LLM
 #   - load our tuned dietary-inquiry system prompt from prompt.txt
 #   - inject per-call context (restaurant_name, call_notes, cuisine, ...) that
 #     arrives as Twilio <Stream> parameters (see server_utils.generate_twiml)
@@ -494,6 +495,19 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 self._sure_floor = sure_floor
                 self._unsure_stop_secs = unsure_stop_secs
                 self._incomplete_stop_secs = incomplete_stop_secs
+
+            def clear(self):
+                # Called by the stop strategy at EVERY turn end. Necessary because
+                # a turn completed via the SILENCE TIMEOUT skips _predict_endpoint
+                # entirely (append_audio clears the buffer first, so the follow-up
+                # analyze_end_of_turn early-returns on an empty buffer). Without
+                # this, _stop_ms would carry a stale per-pause value — e.g. a 1.2s
+                # "unsure" threshold — into the next turn, and could clip someone
+                # mid-list at 1.2s instead of the patient 4s. Reset to the
+                # confidently-incomplete baseline, which the phase switch keeps
+                # current (1.0s opening -> 4.0s once underway).
+                super().clear()
+                self._stop_ms = self._incomplete_stop_secs * 1000
 
             def _predict_endpoint(self, audio_array):
                 result = super()._predict_endpoint(audio_array)
