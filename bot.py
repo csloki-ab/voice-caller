@@ -10,11 +10,24 @@
 
 import os
 import sys
+import time
+from collections import deque
 
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    InterimTranscriptionFrame,
+    InterruptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMRunFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -105,11 +118,130 @@ def build_system_prompt(call_ctx: dict) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Echo gate. pipecat 1.7 has NO acoustic echo cancellation (audio/filters/ are
+# noise suppressors — none take a far-end reference), so on a restaurant's
+# speakerphone our own TTS comes back transcribed as USER speech ~0.5-1s after
+# BotStoppedSpeaking — i.e. right after the mute strategy lifts. Those phantom
+# turns interrupt the bot and (pre-fix) caused it to answer its own words.
+# Fix at the TEXT level: BotTextTap records what the bot says; EchoGate drops
+# user transcriptions that are near-verbatim repeats of it.
+# ---------------------------------------------------------------------------
+_ECHO_WINDOW_SECS = 12.0
+_ECHO_OVERLAP = 0.9
+
+
+def _norm_tokens(text: str) -> list:
+    return [t for t in re.sub(r"[^a-z0-9 ]", " ", text.lower()).split() if t]
+
+
+class BotTextTap(FrameProcessor):
+    """Sits after the LLM; records outgoing bot text (+timestamp) for EchoGate."""
+
+    def __init__(self, recent_bot_text: deque, **kwargs):
+        super().__init__(**kwargs)
+        self._recent = recent_bot_text
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMTextFrame) and frame.text.strip():
+            self._recent.append((time.time(), frame.text))
+        await self.push_frame(frame, direction)
+
+
+class EchoGate(FrameProcessor):
+    """Sits between STT and the user aggregator; drops echo transcriptions.
+
+    A transcription is an echo if >=90% of its tokens appeared in the bot's own
+    output within the last 12s. A single novel content word keeps it alive, so
+    "no onion no garlic, correct" passes while a verbatim bounce-back is dropped.
+    """
+
+    def __init__(self, recent_bot_text: deque, **kwargs):
+        super().__init__(**kwargs)
+        self._recent = recent_bot_text
+
+    def _is_echo(self, text: str) -> bool:
+        toks = _norm_tokens(text)
+        if not toks:
+            return False
+        now = time.time()
+        bot_toks = set()
+        for ts, t in self._recent:
+            if now - ts <= _ECHO_WINDOW_SECS:
+                bot_toks.update(_norm_tokens(t))
+        if not bot_toks:
+            return False
+        overlap = sum(1 for t in toks if t in bot_toks)
+        return overlap / len(toks) >= _ECHO_OVERLAP
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)) and self._is_echo(
+            frame.text
+        ):
+            logger.info(f"ECHO GATE dropped ({type(frame).__name__}): {frame.text!r}")
+            return
+        await self.push_frame(frame, direction)
+
+
+_ZERO_TEXT_RETRY_PROMPT = (
+    "Your last reply had no words in it, so the caller heard silence. Respond now "
+    "with what you should have said — one short, natural sentence continuing the call."
+)
+
+
+class FailsafeAnthropicLLMService(AnthropicLLMService):
+    """Hard failsafe: a completed inference that produced ZERO text is re-run once.
+
+    Silence is the single worst failure on a phone call — it ends the call every
+    time (a restaurant asked "what are you looking for?", our bot went mute, and
+    they hung up). Interrupted responses are exempt: the interrupting turn will
+    produce the answer instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spoke_this_response = False
+        self._interrupted_this_response = False
+        self._zero_text_retried = False
+
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, InterruptionFrame):
+            self._interrupted_this_response = True
+        await super().process_frame(frame, direction)
+
+    async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._spoke_this_response = False
+            self._interrupted_this_response = False
+        elif isinstance(frame, LLMTextFrame) and frame.text.strip():
+            self._spoke_this_response = True
+            self._zero_text_retried = False  # real speech re-arms the failsafe
+        maybe_retry = (
+            isinstance(frame, LLMFullResponseEndFrame)
+            and not self._spoke_this_response
+            and not self._interrupted_this_response
+            and not self._zero_text_retried
+        )
+        await super().push_frame(frame, direction)
+        # Re-check after super(): late graceful-degradation pushes count as speech.
+        if maybe_retry and not self._spoke_this_response:
+            self._zero_text_retried = True  # at most one retry per silence
+            logger.warning("FAILSAFE: LLM response had zero text — re-running inference once")
+            await self.push_frame(
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "developer", "content": _ZERO_TEXT_RETRY_PROMPT}]
+                )
+            )
+            await self.push_frame(LLMRunFrame())
+
+
 async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool):
     system_prompt = build_system_prompt(call_ctx)
     logger.info(f"Calling {call_ctx.get('restaurant_name')!r} — prompt {len(system_prompt)} chars")
 
-    llm = AnthropicLLMService(
+    llm = FailsafeAnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
         # Haiku 4.5 = the latency sweet spot for real-time voice (~0.4s TTFB).
         model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
@@ -267,25 +399,6 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         from pipecat.turns.user_turn_strategies import UserTurnStrategies
         from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
         from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-        from pipecat.turns.user_stop.deferred_user_turn_stop_strategy import deferred
-        from pipecat.turns.user_stop.llm_turn_completion_user_turn_stop_strategy import (
-            LLMTurnCompletionUserTurnStopStrategy,
-        )
-        from pipecat.turns.user_turn_completion_mixin import (
-            UserTurnCompletionConfig,
-            USER_TURN_COMPLETION_INSTRUCTIONS,
-        )
-
-        # The callee speaks first (we're outbound), so their pickup greeting must
-        # ALWAYS be treated as a complete turn — otherwise the gate suppresses our
-        # greeting and the restaurant hears silence and hangs up.
-        _OPENING_MARKER_RULE = (
-            "\n\nPHONE-CALL OPENING EXCEPTION: You placed this call. The callee's FIRST "
-            "utterance after pickup ('Hello?', 'Yes?', a business greeting, or just the "
-            "restaurant's name) is ALWAYS a complete turn: respond with the complete "
-            "marker and your greeting immediately. Never output an incomplete marker "
-            "before you have spoken your first greeting."
-        )
         from pipecat.turns.user_mute.base_user_mute_strategy import BaseUserMuteStrategy
         from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame, Frame
         from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -363,49 +476,29 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             # got steamrolled for seconds. 3 words on INTERIMS reacts in ~300-600ms
             # while still filtering backchannels ("yeah", "uh-huh") and echo blips.
             start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
-            # END-OF-TURN. Two-stage, and the ordering matters:
-            #   1. smart-turn v3 detects a pause and TRIGGERS inference, but
-            #      deferred(...) suppresses its finalization, so an acoustic
-            #      mis-prediction alone can no longer end the caller's turn.
-            #   2. the LLM reads the actual words and decides: it prefixes
-            #      complete/incomplete markers, and on "incomplete" the response
-            #      is SUPPRESSED entirely (no barge-in) until they really finish.
-            # This is the fix for talking over a restaurant reading a dish list:
-            # "We have the fettuccine Alfredo," is obviously unfinished in TEXT
-            # even when it sounds finished acoustically.
+            # END-OF-TURN: smart-turn v3 alone, finalizing directly.
+            #
+            # The LLM marker-gating chain (deferred(...) + LLMTurnCompletion...) is
+            # GONE. It caused THREE distinct silence failures in production:
+            #   1. it rebuilt system_instruction and DISCARDED our diet prompt (P0);
+            #   2. it suppressed the greeting -> up to 12s of opening dead air;
+            #   3. a bare "complete" marker set an internal voiced latch that
+            #      silently swallowed the NEXT inference — the bot went mute exactly
+            #      when a restaurant asked "what are you looking for?", and they hung
+            #      up. That call's dish list was lost with it.
+            # (2) and (3) are structural races inside pipecat's own mixin/controller,
+            # not prompt or model problems — a better model would not fix them.
+            # Mid-list patience is now carried by patient stop_secs (below) plus the
+            # prompt's let-them-finish rules, and FailsafeAnthropicLLMService
+            # guarantees a completed inference can never end in silence.
+            #
             # stop_secs is the ceiling on how long we trust "not done yet" before
-            # force-ending the turn. It was 1.5s, which OVERRODE the model on any
-            # normal 1.5s+ pause between menu items — the actual barge-in cause.
-            # 4.0 covers menu-checking pauses; stays under the 5s controller
-            # watchdog. It costs NO latency on finished answers (those end ~0.2s
-            # after VAD stop via the model, never via this fallback).
-            # NOTE: stop_secs STARTS at the snappy opening value and is raised to
-            # the patient value by FirstNSpeechesUserMuteStrategy after the bot's
-            # first utterance. Opening at 4.0 made the bot sit silent for up to 4s
-            # on "Hello?" — restaurants hung up before it ever spoke.
-            stop=[
-                deferred(TurnAnalyzerUserTurnStopStrategy(
-                    turn_analyzer=_turn_analyzer
-                )),
-                LLMTurnCompletionUserTurnStopStrategy(
-                    config=UserTurnCompletionConfig(
-                        # SECOND dead-air source, independent of stop_secs: if the
-                        # LLM marks the callee's FIRST "Hello?" as incomplete, the
-                        # response is suppressed entirely and nothing is spoken for
-                        # 6s (○) or 12s (◐) — a guaranteed hangup. pipecat's default
-                        # marker rules are written for mid-conversation ("has the
-                        # user answered your question?"), which a bare "Hello?"
-                        # literally fails. We append an opening exception. NOTE the
-                        # config replaces the defaults wholesale, so we concatenate.
-                        instructions=USER_TURN_COMPLETION_INSTRUCTIONS + _OPENING_MARKER_RULE,
-                        # If they're mid-list and go quiet, wait this long before
-                        # gently nudging ("go ahead, I'm listening") instead of
-                        # barging in with analysis.
-                        incomplete_short_timeout=6.0,
-                        incomplete_long_timeout=12.0,
-                    )
-                ),
-            ],
+            # force-ending the turn. It STARTS at the snappy opening value and is
+            # raised to the patient value by FirstNSpeechesUserMuteStrategy after the
+            # bot's first utterance: opening at 4.0 made the bot sit silent for up to
+            # 4s on "Hello?" (restaurants hung up), while 4.0 mid-call is what stops
+            # it barging in between dishes.
+            stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=_turn_analyzer)],
         )
         user_params_kwargs["user_mute_strategies"] = [
             FirstNSpeechesUserMuteStrategy(
@@ -414,7 +507,7 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         ]
         logger.info(
             "Turn-taking active: MinWords(3, interim) + FirstNSpeechMute(2) + "
-            "deferred SmartTurn(4.0s) + LLM turn-completion gating"
+            "SmartTurn(1.0s->4.0s) + EchoGate (LLM gating removed)"
         )
     except Exception as e:
         # Loud, not quiet: silently falling back to defaults is how we shipped
@@ -430,14 +523,20 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         user_params=LLMUserAggregatorParams(**user_params_kwargs),
     )
 
+    # Shared buffer: BotTextTap writes what the bot says, EchoGate reads it to
+    # recognise our own voice coming back off the restaurant's speakerphone.
+    recent_bot_text = deque(maxlen=50)
+
     pipeline = Pipeline(
         [
-            transport.input(),   # audio in from Twilio
-            stt,                 # speech -> text (Deepgram)
+            transport.input(),            # audio in from Twilio
+            stt,                          # speech -> text (Deepgram)
+            EchoGate(recent_bot_text),    # drop our own TTS echoing back (no AEC)
             user_aggregator,
-            llm,                 # Anthropic Claude (our tuned prompt)
-            tts,                 # text -> speech (ElevenLabs Adam)
-            transport.output(),  # audio out to Twilio
+            llm,                          # Anthropic Claude (our tuned prompt)
+            BotTextTap(recent_bot_text),  # record bot lines for the EchoGate
+            tts,                          # text -> speech
+            transport.output(),           # audio out to Twilio
             assistant_aggregator,
         ]
     )
@@ -461,6 +560,17 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Call ended")
+        # Cancel FIRST, then dump. The cancel drives a CancelFrame through the user
+        # aggregator, which flushes any still-buffered end-of-turn user speech into
+        # the context. Dumping before the cancel silently lost whatever the caller
+        # said last — that's how a restaurant's "we also have vegetable korma...
+        # what are you looking for?" was audible on the recording but missing from
+        # our transcript. The context object stays readable after cancel.
+        try:
+            await worker.cancel()
+        except Exception as e:
+            logger.warning(f"Worker cancel before transcript dump failed ({e})")
+
         # Dump a clean, readable transcript (system prompt excluded) so calls can
         # be reviewed by filtering the logs for "TRANSCRIPT". pipecat 1.7 has no
         # TranscriptProcessor, so we read the final LLM context directly.
@@ -489,7 +599,6 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 logger.info(f"TRANSCRIPT | {str(role).upper()}: {content}")
         except Exception as e:
             logger.warning(f"Transcript dump failed ({e})")
-        await worker.cancel()
 
     from pipecat.workers.runner import WorkerRunner
 

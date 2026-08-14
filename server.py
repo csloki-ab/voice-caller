@@ -84,11 +84,6 @@ async def _preload_models():
     from pipecat.turns.user_turn_strategies import UserTurnStrategies
     from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
     from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-    from pipecat.turns.user_stop.deferred_user_turn_stop_strategy import deferred
-    from pipecat.turns.user_stop.llm_turn_completion_user_turn_stop_strategy import (
-        LLMTurnCompletionUserTurnStopStrategy,
-    )
-    from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
     from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
     from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3 as _STA
 
@@ -110,17 +105,23 @@ async def _preload_models():
     UserTurnStrategies(
         start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
         stop=[
-            deferred(TurnAnalyzerUserTurnStopStrategy(
+            TurnAnalyzerUserTurnStopStrategy(
                 turn_analyzer=_STA(params=SmartTurnParams(stop_secs=_patient))
-            )),
-            LLMTurnCompletionUserTurnStopStrategy(
-                config=UserTurnCompletionConfig(
-                    incomplete_short_timeout=6.0, incomplete_long_timeout=12.0
-                )
-            ),
+            )
         ],
     )
-    logger.info("Turn-taking preflight OK (deferred smart-turn + LLM completion gating)")
+
+    # The echo gate and the zero-text failsafe are now load-bearing (no LLM gating
+    # to fall back on), so fail the deploy if either can't be constructed.
+    from bot import EchoGate, BotTextTap, FailsafeAnthropicLLMService  # noqa: F401
+    from collections import deque as _deque
+
+    _probe = _deque(maxlen=4)
+    _probe.append((0.0, "is this the restaurant"))
+    assert EchoGate(_probe)._is_echo("is this the restaurant"), "EchoGate no longer detects echo"
+    assert not EchoGate(_probe)._is_echo("we have chana masala and dal"), "EchoGate too aggressive"
+
+    logger.info("Turn-taking preflight OK (smart-turn only; LLM gating removed; echo gate armed)")
 
 
 @app.post("/dialout", response_model=DialoutResponse)
