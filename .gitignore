@@ -5,6 +5,3 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-
-# Real system prompt (contains a real person's dietary/religious restrictions)
-prompt.local.txt
