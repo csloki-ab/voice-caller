@@ -52,8 +52,24 @@ logger.add(sys.stderr, level="DEBUG")
 # The dynamic-variable placeholders our tuned prompt expects (same names we used on Retell).
 PROMPT_VARS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "visit_date", "party_size"]
 
-with open(os.path.join(os.path.dirname(__file__), "prompt.txt"), "r") as f:
-    PROMPT_TEMPLATE = f.read()
+# The system prompt encodes a REAL PERSON'S dietary and religious restrictions,
+# so it is not something to publish in a public repo. Resolution order:
+#   1. DIET_PROMPT env var  — the real prompt, set in the deployment environment
+#   2. prompt.local.txt     — gitignored, for local development
+#   3. prompt.txt           — the generic template committed here (safe to share)
+# The committed template is a working example, so a clone runs out of the box;
+# it just describes a placeholder diet rather than anyone's actual one.
+_prompt_dir = os.path.dirname(__file__)
+_env_prompt = (os.getenv("DIET_PROMPT") or "").strip()
+if _env_prompt:
+    PROMPT_TEMPLATE = _env_prompt
+    logger.info("Loaded system prompt from DIET_PROMPT env")
+else:
+    _local = os.path.join(_prompt_dir, "prompt.local.txt")
+    _path = _local if os.path.exists(_local) else os.path.join(_prompt_dir, "prompt.txt")
+    with open(_path, "r") as f:
+        PROMPT_TEMPLATE = f.read()
+    logger.info(f"Loaded system prompt from {os.path.basename(_path)}")
 
 import json
 import re

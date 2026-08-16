@@ -10,11 +10,12 @@ Webhook server to handle outbound call requests, initiate calls via Twilio API,
 and handle subsequent WebSocket connections for Media Streams.
 """
 
+import hmac
 import os
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 
@@ -127,6 +128,35 @@ async def _preload_models():
     logger.info("Turn-taking preflight OK (smart-turn only; LLM gating removed; echo gate armed)")
 
 
+def _check_dialout_auth(request: Request) -> None:
+    """Reject unauthenticated /dialout calls.
+
+    This endpoint SPENDS MONEY and dials arbitrary phone numbers, so leaving it
+    open means anyone who learns the service URL can place calls billed to our
+    Twilio account (and make our number the origin of unsolicited calls).
+
+    Enforced only when DIALOUT_SECRET is set, so the secret can be rolled out to
+    the caller (the Cloudflare Worker) without a window where live calls break.
+    Once set on both sides it is mandatory. Compared in constant time.
+    """
+    expected = (os.getenv("DIALOUT_SECRET") or "").strip()
+    if not expected:
+        logger.warning(
+            "DIALOUT_SECRET is not set — /dialout is UNAUTHENTICATED and anyone "
+            "who knows this URL can place calls on our Twilio account. Set it."
+        )
+        return
+
+    provided = (
+        request.headers.get("x-dialout-secret")
+        or request.query_params.get("s")
+        or ""
+    ).strip()
+    if not hmac.compare_digest(provided, expected):
+        logger.warning("Rejected /dialout request with a missing or bad secret")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 @app.post("/dialout", response_model=DialoutResponse)
 async def handle_dialout_request(request: Request) -> DialoutResponse:
     """Handle outbound call request and initiate call via Twilio.
@@ -138,8 +168,10 @@ async def handle_dialout_request(request: Request) -> DialoutResponse:
         DialoutResponse: Response containing call_sid, status, and to_number.
 
     Raises:
-        HTTPException: If request data is invalid or missing required fields.
+        HTTPException: If the shared secret is missing/wrong, or request data is invalid.
     """
+    _check_dialout_auth(request)
+
     logger.info("Received outbound call request")
 
     dialout_request = await dialout_request_from_request(request)
