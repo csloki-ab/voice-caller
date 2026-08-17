@@ -35,10 +35,15 @@ class DialoutRequest(BaseModel):
     candidate_dishes: str = ""
     visit_date: str = ""
     party_size: str = ""
+    # Keypad digits to press at a switchboard/IVR menu (e.g. "2" for
+    # "For the Spotted Dog, press 2"). Empty for normal direct lines.
+    ivr_digit: str = ""
+    ivr_digit_2: str = ""
 
 
 # The context fields we forward from /dialout -> TwiML query params -> <Stream> params -> the bot.
-CONTEXT_FIELDS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "visit_date", "party_size"]
+CONTEXT_FIELDS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "visit_date", "party_size",
+                  "ivr_digit", "ivr_digit_2"]
 
 
 class TwilioCallResult(BaseModel):

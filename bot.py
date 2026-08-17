@@ -189,6 +189,49 @@ class EchoGate(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class IVRKeypadPresser(FrameProcessor):
+    """Press a keypad digit when an IVR menu asks for one.
+
+    Some restaurants sit behind a resort/answering switchboard whose menu only
+    accepts DTMF — e.g. Flanigan's: "Reception, press 1. For the Spotted Dog or
+    table reservations, PRESS 2." Speaking to those menus gets "we have not
+    received a valid response" forever, which is exactly how Spotted Dog and
+    Park House were lost. pipecat emits DTMF as audio tones, which is what works
+    over Twilio Media Streams.
+
+    Only fires when the call context supplies `ivr_digit`, and only when the
+    other side literally says "press" — so it can never fire at a human. Sends
+    once per call by default (a second menu level can be allowed via
+    `ivr_digit_2`).
+    """
+
+    def __init__(self, digits: list, **kwargs):
+        super().__init__(**kwargs)
+        self._pending = [d for d in digits if d]
+        self._armed = True
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+        if (
+            self._armed
+            and self._pending
+            and isinstance(frame, TranscriptionFrame)
+            and "press" in (frame.text or "").lower()
+        ):
+            digit = self._pending.pop(0)
+            self._armed = bool(self._pending)
+            try:
+                from pipecat.frames.frames import OutputDTMFFrame
+
+                logger.info(f"IVR: heard a keypad menu — pressing {digit!r}")
+                await self.push_frame(
+                    OutputDTMFFrame.from_string(str(digit)), FrameDirection.DOWNSTREAM
+                )
+            except Exception as e:
+                logger.warning(f"IVR keypad press failed ({e})")
+
+
 _ZERO_TEXT_RETRY_PROMPT = (
     "Your last reply had no words in it, so the caller heard silence. Respond now "
     "with what you should have said — one short, natural sentence continuing the call."
@@ -604,6 +647,9 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             transport.input(),            # audio in from Twilio
             stt,                          # speech -> text (Deepgram)
             EchoGate(recent_bot_text),    # drop our own TTS echoing back (no AEC)
+            IVRKeypadPresser(             # press digits at switchboard menus
+                [call_ctx.get("ivr_digit"), call_ctx.get("ivr_digit_2")]
+            ),
             user_aggregator,
             llm,                          # Anthropic Claude (our tuned prompt)
             BotTextTap(recent_bot_text),  # record bot lines for the EchoGate
