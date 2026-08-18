@@ -125,6 +125,41 @@ async def _preload_models():
     assert EchoGate(_probe)._is_echo("is this the restaurant"), "EchoGate no longer detects echo"
     assert not EchoGate(_probe)._is_echo("we have chana masala and dal"), "EchoGate too aggressive"
 
+    # DTMF preflight. Spotted Dog was lost three times to a keypad-only
+    # switchboard, and the last attempt fired the tone correctly yet the IVR
+    # answered "We have not received a valid response" on a loop. The tone is
+    # in-band AUDIO over 8kHz mulaw, so if the bundled wav asset ever goes
+    # missing or resamples to silence, the press becomes a no-op that looks
+    # perfectly healthy in the logs. Assert the whole chain at deploy time.
+    from bot import IVRKeypadPresser  # noqa: F401
+    from pipecat.frames.frames import OutputDTMFFrame
+    from pipecat.audio.dtmf.utils import load_dtmf_audio
+
+    # Whole-word matching: a human saying "no pressure" must never trigger a beep.
+    assert IVRKeypadPresser._PRESS_RE.search("for the spotted dog, press 2"), (
+        "IVR press cue no longer matches a real menu line"
+    )
+    assert not IVRKeypadPresser._PRESS_RE.search("sure, no pressure at all"), (
+        "IVR press cue would fire at a human saying 'pressure'"
+    )
+    # The exact string Flanigan's switchboard loops on. If this stops matching,
+    # the retry never fires and we're back to pressing once and going mute.
+    _rejection = "we have not received a valid response. please try again."
+    assert any(c in _rejection for c in IVRKeypadPresser._RETRY_CUES), (
+        "IVR retry cues no longer match the observed rejection prompt"
+    )
+
+    _dtmf_frame = OutputDTMFFrame.from_string("2")
+    assert _dtmf_frame.buttons, "OutputDTMFFrame.from_string produced no buttons"
+    for _button in _dtmf_frame.buttons:
+        _tone = await load_dtmf_audio(_button, sample_rate=8000)
+        # 16-bit @ 8kHz: 40ms (the DTMF spec minimum) = 640 bytes. Anything
+        # shorter than that and no switchboard on earth will register the press.
+        assert len(_tone) >= 640, f"DTMF tone for {_button} is too short ({len(_tone)} bytes)"
+        assert any(_tone), f"DTMF tone for {_button} is all silence"
+
+    logger.info("DTMF preflight OK (press/retry cues match; 8kHz tone renders audible)")
+
     logger.info("Turn-taking preflight OK (smart-turn only; LLM gating removed; echo gate armed)")
 
 

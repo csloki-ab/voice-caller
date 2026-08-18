@@ -9,6 +9,7 @@
 #     arrives as Twilio <Stream> parameters (see server_utils.generate_twiml)
 #
 
+import asyncio
 import os
 import sys
 import time
@@ -196,40 +197,107 @@ class IVRKeypadPresser(FrameProcessor):
     accepts DTMF — e.g. Flanigan's: "Reception, press 1. For the Spotted Dog or
     table reservations, PRESS 2." Speaking to those menus gets "we have not
     received a valid response" forever, which is exactly how Spotted Dog and
-    Park House were lost. pipecat emits DTMF as audio tones, which is what works
-    over Twilio Media Streams.
+    Park House were lost. pipecat emits DTMF as audio tones (500ms at 8kHz),
+    which is what works over Twilio Media Streams.
 
-    Only fires when the call context supplies `ivr_digit`, and only when the
-    other side literally says "press" — so it can never fire at a human. Sends
-    once per call by default (a second menu level can be allowed via
-    `ivr_digit_2`).
+    TIMING IS THE WHOLE GAME. The first version pressed the instant it heard the
+    word "press" — which is partway through "...press 1. For the Spotted Dog,
+    press 2." Many IVRs discard digits sent while the prompt is still playing.
+    On the Spotted Dog attempt the tone fired correctly and the switchboard
+    still answered "We have not received a valid response" on a loop.
+
+    So now we do two things differently:
+      1. WAIT FOR THE MENU TO FINISH. Each "press N" we hear RESTARTS a settle
+         timer; we only send the tone once the menu has stopped enumerating
+         options for `_SETTLE_SECS`. That lands the digit inside the input
+         window rather than on top of the prompt.
+      2. RETRY. If the system says "we have not received a valid response" /
+         "please try again", that is it explicitly telling us the input window
+         is open — so press again. The old code pressed exactly once and then
+         sat mute through every retry the menu offered.
+
+    Only fires when the call context supplies `ivr_digit`, and only on a
+    whole-word "press" (so "no pressure" from a human can't trigger it) — it can
+    never beep at someone on a normal direct line.
     """
+
+    # Whole word only: "pressure"/"impressed" must not trigger a keypress.
+    _PRESS_RE = re.compile(r"\bpress(?:ing)?\b")
+    # The menu telling us it is waiting for input — the best possible moment to press.
+    _RETRY_CUES = (
+        "not received",
+        "valid response",
+        "not a valid",
+        "invalid",
+        "try again",
+        "didn't get",
+        "did not get",
+        "no entry",
+    )
+    _SETTLE_SECS = 2.0        # after the last "press N", let the menu finish
+    _RETRY_SETTLE_SECS = 1.0  # it's already waiting on us — move quicker
+    _MAX_PRESSES = 6          # backstop so we can't beep forever
 
     def __init__(self, digits: list, **kwargs):
         super().__init__(**kwargs)
-        self._pending = [d for d in digits if d]
-        self._armed = True
+        self._digits = [str(d).strip() for d in digits if d and str(d).strip()]
+        self._idx = 0
+        self._presses = 0
+        self._task = None
+        self._pressed_once = False
+        self._last_press_rejected = False
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
-        if (
-            self._armed
-            and self._pending
-            and isinstance(frame, TranscriptionFrame)
-            and "press" in (frame.text or "").lower()
-        ):
-            digit = self._pending.pop(0)
-            self._armed = bool(self._pending)
-            try:
-                from pipecat.frames.frames import OutputDTMFFrame
 
-                logger.info(f"IVR: heard a keypad menu — pressing {digit!r}")
-                await self.push_frame(
-                    OutputDTMFFrame.from_string(str(digit)), FrameDirection.DOWNSTREAM
-                )
-            except Exception as e:
-                logger.warning(f"IVR keypad press failed ({e})")
+        if not self._digits or self._presses >= self._MAX_PRESSES:
+            return
+        if not isinstance(frame, TranscriptionFrame):
+            return
+
+        text = (frame.text or "").lower()
+
+        # The menu is explicitly telling us it's waiting — press again, same digit.
+        if any(cue in text for cue in self._RETRY_CUES):
+            self._last_press_rejected = True
+            await self._schedule(self._RETRY_SETTLE_SECS, "menu rejected our tone")
+            return
+
+        if self._PRESS_RE.search(text):
+            # A fresh menu AFTER a press that wasn't rejected means we advanced a
+            # level, so move to the next configured digit (ivr_digit_2).
+            if (
+                self._pressed_once
+                and not self._last_press_rejected
+                and self._idx + 1 < len(self._digits)
+            ):
+                self._idx += 1
+            # Restart the timer: while it's still listing options, we keep waiting.
+            await self._schedule(self._SETTLE_SECS, "keypad menu, waiting for it to finish")
+
+    async def _schedule(self, delay: float, why: str):
+        if self._task and not self._task.done():
+            await self.cancel_task(self._task)
+        self._task = self.create_task(self._press_after(delay, why))
+
+    async def _press_after(self, delay: float, why: str):
+        await asyncio.sleep(delay)
+        digit = self._digits[min(self._idx, len(self._digits) - 1)]
+        self._presses += 1
+        self._pressed_once = True
+        self._last_press_rejected = False
+        try:
+            from pipecat.frames.frames import OutputDTMFFrame
+
+            logger.info(
+                f"IVR: {why} — pressing {digit!r} (attempt {self._presses}/{self._MAX_PRESSES})"
+            )
+            await self.push_frame(
+                OutputDTMFFrame.from_string(digit), FrameDirection.DOWNSTREAM
+            )
+        except Exception as e:
+            logger.warning(f"IVR keypad press failed ({e})")
 
 
 _ZERO_TEXT_RETRY_PROMPT = (
