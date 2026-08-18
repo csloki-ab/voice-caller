@@ -54,6 +54,33 @@ if _missing:
 
 app = FastAPI()
 
+# Set true only once the boot preflight has fully passed (see _preload_models).
+_PREFLIGHT_OK = False
+
+
+@app.get("/health")
+async def health():
+    """Which build is actually live, and did its preflight pass?
+
+    Added because a push, a green 200, and the fix being live are three
+    different things: Railway kept serving the previous build while the new
+    one was still compiling, so a 200 ninety seconds after `git push` proved
+    nothing. Two scheduled unattended calls were about to depend on a DTMF
+    fix I had no way to confirm had shipped.
+
+    Railway injects RAILWAY_GIT_COMMIT_SHA at build time, so this reports the
+    exact commit serving traffic. Deliberately exposes NO secrets and no env
+    values — just a short SHA and two booleans.
+    """
+    sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    return {
+        "ok": True,
+        "commit": sha[:7] or "unknown",
+        "preflight_ok": _PREFLIGHT_OK,
+        "tts_provider": (os.getenv("TTS_PROVIDER") or "").strip() or "unset",
+    }
+
+
 # Import the bot + pipecat runner eagerly at boot (they were lazy-imported inside
 # the websocket handler, so the first call paid the whole import chain mid-call).
 from pipecat.runner.types import WebSocketRunnerArguments  # noqa: E402
@@ -159,6 +186,8 @@ async def _preload_models():
         assert any(_tone), f"DTMF tone for {_button} is all silence"
 
     logger.info("DTMF preflight OK (press/retry cues match; 8kHz tone renders audible)")
+    global _PREFLIGHT_OK
+    _PREFLIGHT_OK = True
 
     logger.info("Turn-taking preflight OK (smart-turn only; LLM gating removed; echo gate armed)")
 
