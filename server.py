@@ -186,6 +186,34 @@ async def _preload_models():
         assert any(_tone), f"DTMF tone for {_button} is all silence"
 
     logger.info("DTMF preflight OK (press/retry cues match; 8kHz tone renders audible)")
+
+    # Transcript write-back preflight. The bot POSTs each finished transcript to
+    # the Cloudflare Worker so it lands in D1 — because Railway's log stream was
+    # the only copy, and when this dashboard went down a completed call became
+    # unreadable. Two ways that could silently no-op, both cheap to assert:
+    #   1. row_id not forwarded to the bot. EXACTLY the bug ivr_digit had — the
+    #      field existed on the request and never reached the <Stream> params, so
+    #      the feature did nothing and looked fine.
+    #   2. aiohttp missing, so every POST raises into a warning nobody reads.
+    from bot import _persist_transcript  # noqa: F401
+    from server_utils import CONTEXT_FIELDS, DialoutRequest
+    import aiohttp  # noqa: F401
+
+    assert "row_id" in CONTEXT_FIELDS, (
+        "row_id is not forwarded to the bot — transcript write-back would silently no-op"
+    )
+    assert hasattr(DialoutRequest, "model_fields") and "row_id" in DialoutRequest.model_fields, (
+        "DialoutRequest has no row_id field — the Worker's row_id would be dropped"
+    )
+
+    if (os.getenv("TRANSCRIPT_SINK_URL") or "").strip():
+        logger.info("Transcript write-back preflight OK (sink configured)")
+    else:
+        logger.warning(
+            "TRANSCRIPT_SINK_URL is unset — transcripts will live ONLY in these logs. "
+            "Set it to the Worker's /transcript URL (plus TRANSCRIPT_SINK_SECRET) to save them to D1."
+        )
+
     global _PREFLIGHT_OK
     _PREFLIGHT_OK = True
 

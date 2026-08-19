@@ -39,11 +39,14 @@ class DialoutRequest(BaseModel):
     # "For the Spotted Dog, press 2"). Empty for normal direct lines.
     ivr_digit: str = ""
     ivr_digit_2: str = ""
+    # D1 call_log row this call belongs to, so the bot can write its finished
+    # transcript back (see _persist_transcript in bot.py). Blank = no write-back.
+    row_id: str = ""
 
 
 # The context fields we forward from /dialout -> TwiML query params -> <Stream> params -> the bot.
 CONTEXT_FIELDS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "visit_date", "party_size",
-                  "ivr_digit", "ivr_digit_2"]
+                  "ivr_digit", "ivr_digit_2", "row_id"]
 
 
 class TwilioCallResult(BaseModel):

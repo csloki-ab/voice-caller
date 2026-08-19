@@ -352,6 +352,51 @@ class FailsafeAnthropicLLMService(AnthropicLLMService):
             await self.push_frame(LLMRunFrame())
 
 
+async def _persist_transcript(call_ctx: dict, lines: list) -> None:
+    """POST the finished transcript to the Cloudflare Worker so it lands in D1.
+
+    Railway's log stream used to be the ONLY copy of a call transcript. When
+    their dashboard went down one evening we had a completed call to Oscar's and
+    no way to read a word of it — the record existed and was simply unreachable,
+    and the Twilio console could only tell us how LONG the call was. D1 we can
+    query directly through the Cloudflare API, with no dashboard in the loop.
+
+    Logs stay exactly as they were; this is a second, queryable copy. Entirely
+    best-effort: no sink configured, no row_id, or a failed POST all just leave
+    the log dump as the record. A call must never fail because bookkeeping did.
+    """
+    url = (os.getenv("TRANSCRIPT_SINK_URL") or "").strip()
+    row_id = str(call_ctx.get("row_id") or "").strip()
+    if not url or not row_id or not lines:
+        if lines and not url:
+            logger.info("TRANSCRIPT_SINK_URL unset — transcript stays in the logs only")
+        return
+
+    payload = {
+        "id": row_id,
+        "restaurant_name": call_ctx.get("restaurant_name", ""),
+        "transcript": "\n".join(lines),
+    }
+    headers = {"Content-Type": "application/json"}
+    secret = (os.getenv("TRANSCRIPT_SINK_SECRET") or "").strip()
+    if secret:
+        headers["X-Transcript-Secret"] = secret
+
+    try:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                body = (await resp.text())[:200]
+                if resp.status == 200:
+                    logger.info(f"Transcript saved to D1 row {row_id} ({len(lines)} lines)")
+                else:
+                    logger.warning(f"Transcript write-back failed HTTP {resp.status}: {body}")
+    except Exception as e:
+        logger.warning(f"Transcript write-back failed ({e})")
+
+
 async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool):
     system_prompt = build_system_prompt(call_ctx)
     logger.info(f"Calling {call_ctx.get('restaurant_name')!r} — prompt {len(system_prompt)} chars")
@@ -760,6 +805,7 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # Dump a clean, readable transcript (system prompt excluded) so calls can
         # be reviewed by filtering the logs for "TRANSCRIPT". pipecat 1.7 has no
         # TranscriptProcessor, so we read the final LLM context directly.
+        lines = []
         try:
             for m in context.messages:
                 role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "?")
@@ -780,11 +826,18 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     # opening dead-air invisible in the transcript (a call showing only
                     # 'USER: Hello?' looked like an instant hangup). Log it explicitly.
                     marker = raw.strip()[:1]
-                    logger.info(f"TRANSCRIPT | {str(role).upper()}: [suppressed {marker} — bot stayed silent]")
+                    line = f"{str(role).upper()}: [suppressed {marker} — bot stayed silent]"
+                    lines.append(line)
+                    logger.info(f"TRANSCRIPT | {line}")
                     continue
-                logger.info(f"TRANSCRIPT | {str(role).upper()}: {content}")
+                line = f"{str(role).upper()}: {content}"
+                lines.append(line)
+                logger.info(f"TRANSCRIPT | {line}")
         except Exception as e:
             logger.warning(f"Transcript dump failed ({e})")
+
+        # Second copy, somewhere we can actually query. See _persist_transcript.
+        await _persist_transcript(call_ctx, lines)
 
     from pipecat.workers.runner import WorkerRunner
 
