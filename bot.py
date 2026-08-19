@@ -488,7 +488,18 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         return ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             voice_id=_voice_id,
-            model=os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+            # eleven_flash_v2_5, NOT multilingual_v2. multilingual_v2 is
+            # ElevenLabs' highest-QUALITY model and among its slowest; flash is
+            # built for realtime conversation (~75ms vs several hundred). That
+            # time-to-first-byte sits on the critical path of every single reply,
+            # on top of STT endpointing and the LLM, and it is what a person hears
+            # as a gap. A caller at Oscar's hung up on us mid-call — "the latency
+            # was so high and the voice sounded super robotic".
+            # The quality tradeoff is close to free HERE specifically: this is an
+            # 8kHz mulaw phone line, which throws away most of the fidelity
+            # multilingual_v2 is paying for, while we keep its full latency cost.
+            # Responsiveness is what reads as human on a phone, not timbre.
+            model=os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5"),
             params=ElevenLabsTTSService.InputParams(
                 speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
                 stability=float(os.getenv("ELEVENLABS_STABILITY", "0.40")),
