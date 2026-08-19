@@ -246,17 +246,42 @@ class IVRKeypadPresser(FrameProcessor):
         self._task = None
         self._pressed_once = False
         self._last_press_rejected = False
+        self._give_up = None
+        self._gave_up = False
+
+    def set_giveup(self, callback):
+        """Register how to end the call once the menu has clearly beaten us.
+
+        Set after the worker exists (it is what we cancel), so it is late-bound.
+        """
+        self._give_up = callback
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
-        if not self._digits or self._presses >= self._MAX_PRESSES:
-            return
-        if not isinstance(frame, TranscriptionFrame):
+        if not self._digits or not isinstance(frame, TranscriptionFrame):
             return
 
         text = (frame.text or "").lower()
+        menu_cue = bool(self._PRESS_RE.search(text)) or any(c in text for c in self._RETRY_CUES)
+
+        if self._presses >= self._MAX_PRESSES:
+            # Every press is spent and the MENU IS STILL TALKING TO US. Nothing
+            # more will happen: without this the bot sat in the loop until the
+            # 1200s time limit, paying for twenty minutes of hold music. Oscar's
+            # looped six times in ninety seconds and we had no way out.
+            # Safe to hang up on this condition specifically, because a HUMAN
+            # never says "press 1" or "we have not received a valid response" —
+            # only the switchboard does. Any other speech leaves the call alone.
+            if menu_cue and not self._gave_up and self._give_up:
+                self._gave_up = True
+                logger.warning(
+                    f"IVR: {self._presses} presses of {self._digits[self._idx]!r} and the menu is "
+                    "still looping — no human is coming. Ending the call instead of holding."
+                )
+                self.create_task(self._hang_up())
+            return
 
         # The menu is explicitly telling us it's waiting — press again, same digit.
         if any(cue in text for cue in self._RETRY_CUES):
@@ -298,6 +323,14 @@ class IVRKeypadPresser(FrameProcessor):
             )
         except Exception as e:
             logger.warning(f"IVR keypad press failed ({e})")
+
+    async def _hang_up(self):
+        """End the call. Cancelling the worker is the same path a real hangup
+        takes (see on_client_disconnected), so the transcript still gets dumped."""
+        try:
+            await self._give_up()
+        except Exception as e:
+            logger.warning(f"IVR give-up failed ({e})")
 
 
 _ZERO_TEXT_RETRY_PROMPT = (
@@ -766,14 +799,14 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     # recognise our own voice coming back off the restaurant's speakerphone.
     recent_bot_text = deque(maxlen=50)
 
+    ivr_presser = IVRKeypadPresser([call_ctx.get("ivr_digit"), call_ctx.get("ivr_digit_2")])
+
     pipeline = Pipeline(
         [
             transport.input(),            # audio in from Twilio
             stt,                          # speech -> text (Deepgram)
             EchoGate(recent_bot_text),    # drop our own TTS echoing back (no AEC)
-            IVRKeypadPresser(             # press digits at switchboard menus
-                [call_ctx.get("ivr_digit"), call_ctx.get("ivr_digit_2")]
-            ),
+            ivr_presser,                  # press digits at switchboard menus
             user_aggregator,
             llm,                          # Anthropic Claude (our tuned prompt)
             BotTextTap(recent_bot_text),  # record bot lines for the EchoGate
@@ -792,6 +825,10 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             enable_usage_metrics=True,
         ),
     )
+
+    # Late-bound on purpose: the presser has to sit in the pipeline before the
+    # worker can be built, but ending the call means cancelling that worker.
+    ivr_presser.set_giveup(worker.cancel)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):

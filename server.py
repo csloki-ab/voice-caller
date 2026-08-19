@@ -176,6 +176,13 @@ async def _preload_models():
         "IVR retry cues no longer match the observed rejection prompt"
     )
 
+    # The give-up path is late-bound (set_giveup after the worker exists), which
+    # is exactly the shape that silently no-ops if a rename slips through.
+    assert hasattr(IVRKeypadPresser, "set_giveup"), (
+        "IVRKeypadPresser.set_giveup is gone — the bot would hold on a looping "
+        "menu until the call time limit instead of hanging up"
+    )
+
     _dtmf_frame = OutputDTMFFrame.from_string("2")
     assert _dtmf_frame.buttons, "OutputDTMFFrame.from_string produced no buttons"
     for _button in _dtmf_frame.buttons:
