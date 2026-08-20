@@ -755,7 +755,25 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             # only lands on endpointing, so a manager trying to reclaim the floor
             # got steamrolled for seconds. 3 words on INTERIMS reacts in ~300-600ms
             # while still filtering backchannels ("yeah", "uh-huh") and echo blips.
-            start=[MinWordsUserTurnStartStrategy(min_words=3, use_interim=True)],
+            start=[
+                MinWordsUserTurnStartStrategy(
+                    # ONE word, not three. This is the bar for the user to take the
+                    # floor, and at three words a bare "Yes." or "No." NEVER CLEARS
+                    # IT. On the Koi call the other side answered "Yes.", "No.",
+                    # "Thank you." over and over — none of them registered as him
+                    # taking the floor, so the bot talked straight over him, and
+                    # then sat waiting for a turn that had already happened. He
+                    # said "Hello?" three times. Same shape on the Oscar's call:
+                    # "No lard.", "There is.", "Yes."
+                    # Yes/no answers are the single most common reply on a dietary
+                    # call. A bar that structurally cannot hear them was the bug.
+                    # Safe from our own echo: the strategies run on the user
+                    # aggregator, which sits DOWNSTREAM of EchoGate, and EchoGate
+                    # drops both final AND interim frames (verified, not assumed).
+                    min_words=int(os.getenv("TURN_MIN_WORDS", "1")),
+                    use_interim=True,
+                )
+            ],
             # END-OF-TURN: smart-turn v3 alone, finalizing directly.
             #
             # The LLM marker-gating chain (deferred(...) + LLMTurnCompletion...) is
