@@ -537,7 +537,15 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 speed=float(os.getenv("ELEVENLABS_SPEED", "1.0")),
                 stability=float(os.getenv("ELEVENLABS_STABILITY", "0.40")),
                 similarity_boost=float(os.getenv("ELEVENLABS_SIMILARITY", "0.75")),
-                style=float(os.getenv("ELEVENLABS_STYLE", "0.35")),
+                # style=0, NOT 0.35. Style exaggeration makes delivery more
+                # performative — good for narration, wrong for a phone call, where
+                # it is a large part of what people hear as "obviously AI".
+                # ElevenLabs' own guidance for conversational agents is style at
+                # zero, with stability in the 0.35-0.45 band (we are at 0.40).
+                # Feedback after the Koi call: "voice sounded obviously AI" — the
+                # call itself went well, so the content was fine and the delivery
+                # was not.
+                style=float(os.getenv("ELEVENLABS_STYLE", "0.0")),
             ),
         )
 
