@@ -409,6 +409,8 @@ async def _persist_transcript(call_ctx: dict, lines: list) -> None:
         "id": row_id,
         "restaurant_name": call_ctx.get("restaurant_name", ""),
         "transcript": "\n".join(lines),
+        # Which voice/model spoke on this call — see the VOICE log line.
+        "voice": call_ctx.get("_voice", ""),
     }
     headers = {"Content-Type": "application/json"}
     secret = (os.getenv("TRANSCRIPT_SINK_SECRET") or "").strip()
@@ -518,6 +520,13 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
             or _voice_map.get("default")
             or os.getenv("ELEVENLABS_VOICE_ID")
         )
+        # Record WHICH VOICE this call used. We swapped voices four times while
+        # judging calls by ear, and could never answer "which one sounded best?"
+        # because nothing tied a voice to an outcome — the attribution had to be
+        # reconstructed from deploy timestamps afterwards. Now every call says so
+        # in its own logs, and it rides along on the transcript write-back.
+        call_ctx["_voice"] = f"elevenlabs:{_voice_id}:{os.getenv('ELEVENLABS_MODEL', 'eleven_flash_v2_5')}"
+        logger.info(f"VOICE | {call_ctx['_voice']}")
         return ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             voice_id=_voice_id,
