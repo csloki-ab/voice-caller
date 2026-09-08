@@ -92,6 +92,33 @@ CUISINE_TERMS = {
 }
 
 
+# A trailing "(...)" on a row name is OUR bookkeeping, not part of the business.
+# call_log rows get labels like "Jane on Fillmore (attempt 3, at open)" so a retry
+# can be told apart from the call it replaces — and restaurant_name is ALSO what
+# the bot says out loud and what Deepgram is told to listen for. On 2026-09-08 the
+# rendered prompt read: Is this Jane on Fillmore (attempt 3, at open)? Strip it.
+_ROW_LABEL_SUFFIX = re.compile(r"\s*\([^()]*\)\s*$")
+
+# Words that start a sentence or a bullet in OUR OWN notes are capitalised by
+# grammar, not because they are names. Boosting them actively hurts.
+_NOTE_STOPWORDS = frozenset(
+    {
+        "they", "their", "there", "then", "this", "that", "with", "when", "what",
+        "which", "while", "where", "would", "could", "should", "never", "always",
+        "only", "just", "also", "here", "have", "does", "note", "live", "call",
+        "already", "connected", "someone", "whoever", "timing", "still", "from",
+        "your", "yours", "these", "those", "about", "after", "before", "because",
+        "attempt", "open", "must", "make", "made", "said", "says", "ask", "asked",
+    }
+)
+
+
+def spoken_name(raw: str) -> str:
+    """The restaurant's name as it should be SAID, with our row label stripped."""
+    cleaned = _ROW_LABEL_SUFFIX.sub("", str(raw or "")).strip()
+    return cleaned or str(raw or "").strip()
+
+
 def build_keyterms(call_ctx: dict, cap: int = 50) -> list:
     """Build this call's Deepgram keyterm list from the per-call context."""
     terms = list(BASE_DIET_TERMS)
@@ -104,9 +131,25 @@ def build_keyterms(call_ctx: dict, cap: int = 50) -> list:
     for dish in re.split(r"[,;/]", call_ctx.get("candidate_dishes") or ""):
         if dish.strip():
             terms.append(dish.strip())
-    for w in re.findall(r"[A-Za-z]{4,}", call_ctx.get("call_notes") or ""):
-        if w[0].isupper() and w.lower() not in {"they", "their", "there", "then", "this", "that", "with"}:
-            terms.append(w)  # proper nouns from the note (dish/restaurant names)
+    # Proper nouns from the note (dish/restaurant names) — but ONLY those. This
+    # used to take every capitalised word, which meant our own emphasis leaked
+    # into the recogniser: a call on 2026-09-08 was told to listen for 'LIVE',
+    # 'CALL', 'ALREADY', 'CONNECTED', 'Never', 'Whoever', 'NOTE', 'TIMING' —
+    # words no restaurant says, biasing 8kHz audio toward nonsense. Keyterms are
+    # a thumb on the scale, so junk in here is worse than nothing.
+    notes = call_ctx.get("call_notes") or ""
+    for m in re.finditer(r"[A-Za-z]{4,}", notes):
+        w = m.group(0)
+        if not w[0].isupper() or w.isupper():
+            continue  # lowercase, or ALL-CAPS emphasis of ours
+        if w.lower() in _NOTE_STOPWORDS:
+            continue
+        # Capitalised because it opens a sentence or a bullet? Then it is grammar,
+        # not a name. Look at the last non-space character before it.
+        prev = notes[: m.start()].rstrip(" \t")[-1:]
+        if prev == "" or prev in ".!?:;\n\r-–—*•(":
+            continue
+        terms.append(w)
     seen, out = set(), []
     for t in terms:
         if t.lower() not in seen:
@@ -433,8 +476,18 @@ async def _persist_transcript(call_ctx: dict, lines: list) -> None:
 
 
 async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool):
+    # Say the business's name, not our row label. Do this BEFORE the prompt and
+    # the keyterms are built — both read restaurant_name. The raw label is kept
+    # for the logs so a call can still be traced back to the row that made it.
+    _row_label = str(call_ctx.get("restaurant_name") or "")
+    call_ctx["_row_label"] = _row_label
+    call_ctx["restaurant_name"] = spoken_name(_row_label)
+
     system_prompt = build_system_prompt(call_ctx)
-    logger.info(f"Calling {call_ctx.get('restaurant_name')!r} — prompt {len(system_prompt)} chars")
+    logger.info(
+        f"Calling {call_ctx['restaurant_name']!r} (row label {_row_label!r}) "
+        f"— prompt {len(system_prompt)} chars"
+    )
 
     llm = FailsafeAnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -691,6 +744,9 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # code change if live calls show we're still too eager or too slow.
         _opening_stop_secs = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
         _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+        # Read once, used by both the strategy and the status line below, so the
+        # two can never disagree again.
+        _turn_min_words = int(os.getenv("TURN_MIN_WORDS", "1"))
         # A SINGLE flat stop_secs is what made the bot feel robotic. smart-turn
         # runs its model ONCE per pause and never re-runs it, so whenever it
         # predicted "not done" (common on 8kHz narrowband) nothing could end the
@@ -779,7 +835,7 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     # Safe from our own echo: the strategies run on the user
                     # aggregator, which sits DOWNSTREAM of EchoGate, and EchoGate
                     # drops both final AND interim frames (verified, not assumed).
-                    min_words=int(os.getenv("TURN_MIN_WORDS", "1")),
+                    min_words=_turn_min_words,
                     use_interim=True,
                 )
             ],
@@ -812,9 +868,15 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                 n=2, turn_analyzer=_turn_analyzer, patient_stop_secs=_patient_stop_secs
             )
         ]
+        # Print the REAL numbers. This line used to be a hardcoded "MinWords(3...)"
+        # left over from before the bar was lowered to 1, so the logs asserted a
+        # regression that did not exist and nearly sent a debugging session the
+        # wrong way. A status line that can disagree with the code is worse than
+        # no status line.
         logger.info(
-            "Turn-taking active: MinWords(3, interim) + FirstNSpeechMute(2) + "
-            "SmartTurn(1.0s->4.0s) + EchoGate (LLM gating removed)"
+            f"Turn-taking active: MinWords({_turn_min_words}, interim) + "
+            f"FirstNSpeechMute(2) + SmartTurn({_opening_stop_secs}s->"
+            f"{_patient_stop_secs}s) + EchoGate (LLM gating removed)"
         )
     except Exception as e:
         # Loud, not quiet: silently falling back to defaults is how we shipped
@@ -835,6 +897,9 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
     recent_bot_text = deque(maxlen=50)
 
     ivr_presser = IVRKeypadPresser([call_ctx.get("ivr_digit"), call_ctx.get("ivr_digit_2")])
+
+    # How long to wait for the other side before greeting anyway (see below).
+    _greet_after_secs = float(os.getenv("OPENING_GREET_AFTER_SECS", "3.0"))
 
     pipeline = Pipeline(
         [
@@ -870,6 +935,33 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # User-first: we wait for the restaurant to speak; the prompt's OPENING
         # section tells the LLM to greet only after it hears them.
         logger.info("Media stream connected; waiting for the other side to speak")
+
+        # ...but not forever. Waiting is right when we DO hear the greeting — it
+        # stops us talking over "Good morning, Jane on Fillmore". It is fatal when
+        # we don't. Jane on Fillmore, 2026-09-08 07:15 PT: media stream open at
+        # :32, call over at :43, and NOT ONE line transcribed from either side.
+        # An empty transcript means the bot never spoke, because it was still
+        # waiting for a greeting that 8kHz audio in a noisy cafe never delivered.
+        # Eleven seconds of dead air is exactly how long someone gives a silent
+        # line before hanging up. So: if nothing at all has reached the context by
+        # the deadline, say hello anyway. An empty context is a strong signal —
+        # not "they are mid-sentence" but "STT has produced nothing whatsoever".
+        async def _greet_if_silent():
+            try:
+                await asyncio.sleep(_greet_after_secs)
+                if context.messages:
+                    return  # they spoke, or we already did — normal path
+                logger.info(
+                    f"Nothing heard in {_greet_after_secs}s — greeting first "
+                    "rather than leaving the line silent"
+                )
+                await worker.queue_frames([LLMRunFrame()])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Opening greeting fallback failed ({e})")
+
+        asyncio.create_task(_greet_if_silent())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
