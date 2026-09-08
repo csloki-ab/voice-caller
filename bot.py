@@ -381,6 +381,15 @@ _ZERO_TEXT_RETRY_PROMPT = (
     "with what you should have said — one short, natural sentence continuing the call."
 )
 
+# Given to the model when we open the call ourselves because nothing was heard.
+# It also has to CARRY the context, not just trigger one: Anthropic refuses a
+# completion with an empty message list, so a bare run frame 400s.
+_OPENING_NUDGE = (
+    "The line is open and they have picked up, but nothing they said came through. "
+    "Speak first now: greet them and check you have reached the right place, in one "
+    "short sentence. Do not mention the silence or the transcription."
+)
+
 
 class FailsafeAnthropicLLMService(AnthropicLLMService):
     """Hard failsafe: a completed inference that produced ZERO text is re-run once.
@@ -955,7 +964,22 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
                     f"Nothing heard in {_greet_after_secs}s — greeting first "
                     "rather than leaving the line silent"
                 )
-                await worker.queue_frames([LLMRunFrame()])
+                # An LLMRunFrame ALONE cannot work here, and the first version of
+                # this fallback shipped that way. The context is empty by
+                # definition at this point, and Anthropic rejects a completion
+                # with no messages: 400 "messages: at least one message is
+                # required". The call self-healed only because the zero-text
+                # FAILSAFE happened to re-run with its own nudge — the caller
+                # heard a second of dead air, then the greeting twice. So give
+                # the model something to answer, exactly as the failsafe does.
+                await worker.queue_frames(
+                    [
+                        LLMMessagesAppendFrame(
+                            messages=[{"role": "developer", "content": _OPENING_NUDGE}]
+                        ),
+                        LLMRunFrame(),
+                    ]
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
