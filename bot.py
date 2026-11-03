@@ -285,11 +285,24 @@ class EchoGate(FrameProcessor):
             return False
         now = time.time()
         bot_toks = set()
+        bot_lines = []
         for ts, t in self._recent:
             if now - ts <= _ECHO_WINDOW_SECS:
-                bot_toks.update(_norm_tokens(t))
+                line = _norm_tokens(t)
+                bot_lines.append(line)
+                bot_toks.update(line)
         if not bot_toks:
             return False
+        # A short utterance is only an echo if it is a word-for-word run of
+        # something the bot just said. Bag-of-words matching dropped a real
+        # question: the owner asked "What's Instinct?" right after the bot said
+        # "what's worked well" and "how's Instinct been", every word matched,
+        # and the bot sat silent for 45 seconds until he hung up. Real echoes
+        # come back as contiguous chunks; a new question re-uses words in a new
+        # order.
+        if len(toks) < 6:
+            n = len(toks)
+            return any(line[i:i + n] == toks for line in bot_lines for i in range(len(line) - n + 1))
         overlap = sum(1 for t in toks if t in bot_toks)
         return overlap / len(toks) >= _ECHO_OVERLAP
 
@@ -939,6 +952,10 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # code change if live calls show we're still too eager or too slow.
         _opening_stop_secs = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
         _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+        # 4s of silence before replying suits a restaurant reading out a menu,
+        # but made a general call feel broken (long dead air after every answer).
+        if is_general(call_ctx):
+            _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS_GENERAL", "2.0"))
         # Read once, used by both the strategy and the status line below, so the
         # two can never disagree again.
         _turn_min_words = int(os.getenv("TURN_MIN_WORDS", "1"))

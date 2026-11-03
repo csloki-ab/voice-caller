@@ -214,6 +214,13 @@ async def _preload_models():
     _probe.append((_time.time(), "is this the restaurant"))
     assert EchoGate(_probe)._is_echo("is this the restaurant"), "EchoGate no longer detects echo"
     assert not EchoGate(_probe)._is_echo("we have chana masala and dal"), "EchoGate too aggressive"
+    # The 3 Nov test call: a real short question re-using the bot's words in a
+    # new order must get through.
+    _probe2 = _deque(maxlen=4)
+    _probe2.append((_time.time(), "So, how's Instinct been working for you?"))
+    _probe2.append((_time.time(), "What's worked well?"))
+    assert not EchoGate(_probe2)._is_echo("What's Instinct?"), "EchoGate drops real short questions"
+    assert EchoGate(_probe2)._is_echo("what's worked well"), "EchoGate misses a verbatim echo"
 
     # DTMF preflight. Spotted Dog was lost three times to a keypad-only
     # switchboard, and the last attempt fired the tone correctly yet the IVR
