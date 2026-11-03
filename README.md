@@ -48,12 +48,17 @@ repo.
 
 ## Place a call
 
+`/dialout` needs the `X-Dialout-Secret` header (the server will not boot without
+`DIALOUT_SECRET`). It only dials US/Canada numbers unless `ALLOWED_DIAL_PREFIXES`
+says otherwise, caps itself at `MAX_CALLS_PER_HOUR` (default 8), and always calls
+from `TWILIO_FROM_NUMBER`. Add `"dry_run": true` to check everything without dialing.
+
 ```bash
 curl -X POST "$LOCAL_SERVER_URL/dialout" \
   -H "Content-Type: application/json" \
+  -H "X-Dialout-Secret: $DIALOUT_SECRET" \
   -d '{
     "to_number": "+15550000000",
-    "from_number": "'"$TWILIO_FROM_NUMBER"'",
     "restaurant_name": "Example Kitchen",
     "cuisine": "Middle Eastern build-your-own",
     "call_notes": "Caller is vegan and cannot have onion or garlic in any form. Ask about falafel and hummus (made fresh, without garlic?), fried eggplant, and an allium-free build-your-own plate."

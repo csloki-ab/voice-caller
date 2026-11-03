@@ -48,7 +48,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 load_dotenv(override=True)
 
 logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 
 # The dynamic-variable placeholders our tuned prompt expects (same names we used on Retell).
 PROMPT_VARS = ["restaurant_name", "call_notes", "cuisine", "candidate_dishes", "visit_date", "party_size"]
@@ -465,7 +465,9 @@ async def _persist_transcript(call_ctx: dict, lines: list) -> None:
         "voice": call_ctx.get("_voice", ""),
     }
     headers = {"Content-Type": "application/json"}
-    secret = (os.getenv("TRANSCRIPT_SINK_SECRET") or "").strip()
+    # Falls back to DIALOUT_SECRET, which the Worker also accepts for /transcript,
+    # so the two services share one secret instead of two to rotate.
+    secret = (os.getenv("TRANSCRIPT_SINK_SECRET") or os.getenv("DIALOUT_SECRET") or "").strip()
     if secret:
         headers["X-Transcript-Secret"] = secret
 
@@ -1065,5 +1067,23 @@ async def bot(runner_args: RunnerArguments):
             if isinstance(extra, dict):
                 call_ctx.update(extra)
     logger.info(f"call_ctx keys: {list(call_ctx.keys())}")
+
+    # Only run for a call our own /dialout created (signature set in
+    # server_utils.make_twilio_call, checked again at /twiml). Anyone else who
+    # finds the /ws URL gets nothing: no STT, LLM or TTS spend.
+    from server_utils import verify_call
+
+    if not verify_call(
+        str(call_ctx.get("to_number") or ""),
+        str(call_ctx.get("row_id") or ""),
+        str(call_ctx.get("ts") or ""),
+        str(call_ctx.get("sig") or ""),
+    ):
+        logger.warning("Rejected websocket: missing, bad or expired call signature")
+        try:
+            await runner_args.websocket.close()
+        except Exception:
+            pass
+        return
 
     await run_bot(transport, call_ctx, runner_args.handle_sigint)

@@ -10,8 +10,11 @@ Webhook server to handle outbound call requests, initiate calls via Twilio API,
 and handle subsequent WebSocket connections for Media Streams.
 """
 
+import asyncio
 import hmac
 import os
+import time
+from collections import deque
 
 import uvicorn
 from dotenv import load_dotenv
@@ -42,6 +45,9 @@ REQUIRED_ENV = [
     "TWILIO_AUTH_TOKEN",
     "TWILIO_FROM_NUMBER",
     "LOCAL_SERVER_URL",
+    # Mandatory since the Oct 2026 Railway breach: without it /dialout would be
+    # open to the internet, and /twiml + /ws could not verify a call is ours.
+    "DIALOUT_SECRET",
 ]
 _missing = [k for k in REQUIRED_ENV if not (os.getenv(k) or "").strip()]
 if _missing:
@@ -52,7 +58,9 @@ if _missing:
     )
 
 
-app = FastAPI()
+# No /docs, /redoc or /openapi.json: they handed anyone a point-and-click form
+# for /dialout.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 # Set true only once the boot preflight has fully passed (see _preload_models).
 _PREFLIGHT_OK = False
@@ -73,12 +81,63 @@ async def health():
     values — just a short SHA and two booleans.
     """
     sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
-    return {
-        "ok": True,
-        "commit": sha[:7] or "unknown",
-        "preflight_ok": _PREFLIGHT_OK,
-        "tts_provider": (os.getenv("TTS_PROVIDER") or "").strip() or "unset",
-    }
+    # 503 until the preflight passes, so a status-code check (Railway's deploy
+    # healthcheck, the Worker's warm-up) can't mistake a broken build for a good one.
+    return JSONResponse(
+        status_code=200 if _PREFLIGHT_OK else 503,
+        content={
+            "ok": _PREFLIGHT_OK,
+            "commit": sha[:7] or "unknown",
+            "preflight_ok": _PREFLIGHT_OK,
+            "tts_provider": (os.getenv("TTS_PROVIDER") or "").strip() or "unset",
+        },
+    )
+
+
+async def _probe(session, name: str, url: str, **kw) -> tuple[str, dict]:
+    import aiohttp
+
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6), **kw) as r:
+            out = {"ok": r.status == 200, "status": r.status}
+            if r.status == 200 and name in ("elevenlabs", "twilio"):
+                body = await r.json(content_type=None)
+                if name == "elevenlabs":
+                    out["characters_left"] = (body.get("character_limit") or 0) - (body.get("character_count") or 0)
+                else:
+                    out["balance"] = f'{body.get("balance")} {body.get("currency")}'
+            return name, out
+    except Exception as e:
+        return name, {"ok": False, "error": type(e).__name__}
+
+
+@app.get("/health/deep")
+async def health_deep(request: Request):
+    """Prove every provider key works WITHOUT placing a call.
+
+    One free, read-only request per provider. Returns only booleans, HTTP
+    codes and balances, never a key. Needs the DIALOUT_SECRET header because it
+    spends a little provider quota and reveals balances.
+    """
+    _check_dialout_auth(request)
+    import aiohttp
+
+    env = lambda k: (os.getenv(k) or "").strip()  # noqa: E731
+    sid = env("TWILIO_ACCOUNT_SID")
+    async with aiohttp.ClientSession() as s:
+        results = dict(await asyncio.gather(
+            _probe(s, "anthropic", "https://api.anthropic.com/v1/models",
+                   headers={"x-api-key": env("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01"}),
+            _probe(s, "deepgram", "https://api.deepgram.com/v1/projects",
+                   headers={"Authorization": f"Token {env('DEEPGRAM_API_KEY')}"}),
+            _probe(s, "elevenlabs", "https://api.elevenlabs.io/v1/user/subscription",
+                   headers={"xi-api-key": env("ELEVENLABS_API_KEY")}),
+            _probe(s, "twilio", f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Balance.json",
+                   auth=aiohttp.BasicAuth(sid, env("TWILIO_AUTH_TOKEN"))),
+        ))
+    all_ok = _PREFLIGHT_OK and all(v.get("ok") for v in results.values())
+    return JSONResponse(status_code=200 if all_ok else 503,
+                        content={"ok": all_ok, "preflight_ok": _PREFLIGHT_OK, **results})
 
 
 # Import the bot + pipecat runner eagerly at boot (they were lazy-imported inside
@@ -234,26 +293,31 @@ def _check_dialout_auth(request: Request) -> None:
     open means anyone who learns the service URL can place calls billed to our
     Twilio account (and make our number the origin of unsolicited calls).
 
-    Enforced only when DIALOUT_SECRET is set, so the secret can be rolled out to
-    the caller (the Cloudflare Worker) without a window where live calls break.
-    Once set on both sides it is mandatory. Compared in constant time.
+    Always enforced (DIALOUT_SECRET is in REQUIRED_ENV, so the server refuses to
+    boot without it). Header only: a secret in a query string ends up in logs.
+    Compared in constant time.
     """
     expected = (os.getenv("DIALOUT_SECRET") or "").strip()
-    if not expected:
-        logger.warning(
-            "DIALOUT_SECRET is not set — /dialout is UNAUTHENTICATED and anyone "
-            "who knows this URL can place calls on our Twilio account. Set it."
-        )
-        return
-
-    provided = (
-        request.headers.get("x-dialout-secret")
-        or request.query_params.get("s")
-        or ""
-    ).strip()
-    if not hmac.compare_digest(provided, expected):
+    provided = (request.headers.get("x-dialout-secret") or "").strip()
+    if not expected or not hmac.compare_digest(provided, expected):
         logger.warning("Rejected /dialout request with a missing or bad secret")
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# Hard cap on real calls per rolling hour. Even with a leaked secret this bounds
+# what anyone can spend before we notice. Resets on restart, which is fine.
+_MAX_CALLS_PER_HOUR = int(os.getenv("MAX_CALLS_PER_HOUR", "8"))
+_recent_calls: deque = deque()
+
+
+def _check_rate_limit() -> None:
+    now = time.time()
+    while _recent_calls and now - _recent_calls[0] > 3600:
+        _recent_calls.popleft()
+    if len(_recent_calls) >= _MAX_CALLS_PER_HOUR:
+        logger.warning(f"Refused /dialout: {_MAX_CALLS_PER_HOUR} calls already placed this hour")
+        raise HTTPException(status_code=429, detail="Too many calls this hour")
+    _recent_calls.append(now)
 
 
 @app.post("/dialout", response_model=DialoutResponse)
@@ -274,12 +338,14 @@ async def handle_dialout_request(request: Request) -> DialoutResponse:
     logger.info("Received outbound call request")
 
     dialout_request = await dialout_request_from_request(request)
+    if not dialout_request.dry_run:
+        _check_rate_limit()
 
     call_result = await make_twilio_call(dialout_request)
 
     return DialoutResponse(
         call_sid=call_result.call_sid,
-        status="call_initiated",
+        status="dry_run_ok" if dialout_request.dry_run else "call_initiated",
         to_number=call_result.to_number,
     )
 

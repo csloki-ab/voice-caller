@@ -4,11 +4,15 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import hashlib
+import hmac
 import os
+import re
+import time
 
 from fastapi import HTTPException, Request
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
@@ -25,23 +29,93 @@ class DialoutRequest(BaseModel):
     """
 
     to_number: str
-    # Optional: defaults to the server's TWILIO_FROM_NUMBER env in make_twilio_call
-    # so schedulers (the Cloudflare cron) don't have to duplicate the Twilio number.
-    from_number: str = ""
+    # No from_number field on purpose: we always call from TWILIO_FROM_NUMBER.
+    # Letting a request pick the caller ID was an abuse vector and nothing used it.
     # Per-call dietary context injected into the tuned prompt (all optional):
-    restaurant_name: str = ""
-    call_notes: str = ""
-    cuisine: str = ""
-    candidate_dishes: str = ""
-    visit_date: str = ""
-    party_size: str = ""
+    # Length caps: these go into the prompt and onto the /twiml URL.
+    restaurant_name: str = Field("", max_length=200)
+    call_notes: str = Field("", max_length=3000)
+    cuisine: str = Field("", max_length=200)
+    candidate_dishes: str = Field("", max_length=1500)
+    visit_date: str = Field("", max_length=40)
+    party_size: str = Field("", max_length=20)
     # Keypad digits to press at a switchboard/IVR menu (e.g. "2" for
     # "For the Spotted Dog, press 2"). Empty for normal direct lines.
-    ivr_digit: str = ""
-    ivr_digit_2: str = ""
+    ivr_digit: str = Field("", max_length=4, pattern=r"^[0-9*#w]*$")
+    ivr_digit_2: str = Field("", max_length=4, pattern=r"^[0-9*#w]*$")
     # D1 call_log row this call belongs to, so the bot can write its finished
     # transcript back (see _persist_transcript in bot.py). Blank = no write-back.
-    row_id: str = ""
+    row_id: str = Field("", max_length=12, pattern=r"^\d*$")
+    # Validate everything (auth, target, TwiML URL) but don't actually dial.
+    # Lets a post-deploy smoke test prove the whole path with zero risk.
+    dry_run: bool = False
+
+    @field_validator("to_number")
+    @classmethod
+    def _check_target(cls, v: str) -> str:
+        return check_dial_target(v)
+
+
+# Where we are allowed to call. Default is US/Canada (+1) only. Toll fraud runs
+# on international and premium-rate numbers, and every restaurant we have ever
+# called is +1. Add e.g. "+52" here (Railway variable ALLOWED_DIAL_PREFIXES,
+# comma-separated) only while a Mexico batch is live.
+_NANP_RE = re.compile(r"^\+1[2-9]\d{2}[2-9]\d{6}$")
+# NANP area codes that are premium-rate, personal or otherwise never a restaurant.
+_BLOCKED_NANP = {"900", "976", "500", "521", "522", "533", "544", "566", "577", "588"}
+# +1 is not just the US: these are Caribbean and Atlantic countries that share
+# it, and several (Jamaica 876, Dominican Republic 809/829/849) are classic
+# toll-fraud destinations. Canada stays allowed.
+_BLOCKED_NANP |= {"242", "246", "264", "268", "284", "345", "441", "473", "649", "658", "664",
+                  "721", "758", "767", "784", "809", "829", "849", "868", "869", "876"}
+
+
+def check_dial_target(number: str) -> str:
+    n = re.sub(r"[\s().-]", "", number or "")
+    allowed = [p.strip() for p in (os.getenv("ALLOWED_DIAL_PREFIXES") or "+1").split(",") if p.strip()]
+    if not any(n.startswith(p) for p in allowed):
+        raise ValueError("number is outside the allowed countries")
+    if n.startswith("+1"):
+        if not _NANP_RE.match(n):
+            raise ValueError("not a valid US/Canada number")
+        if n[2:5] in _BLOCKED_NANP:
+            raise ValueError("premium-rate or non-geographic number")
+    elif not re.fullmatch(r"\+\d{8,15}", n):
+        raise ValueError("not a valid E.164 number")
+    return n
+
+
+# --- Per-call signature ------------------------------------------------------
+# /twiml and /ws are fetched by Twilio, not by us, so they cannot carry the
+# DIALOUT_SECRET header. Instead /dialout signs (number, row, time) with the
+# secret and puts the signature on the /twiml URL and the <Stream> parameters.
+# A valid signature proves the call was created by our own /dialout, so a
+# stranger who finds the URLs gets a 403 / a closed socket, not a free
+# STT+LLM+TTS session. This needs no Twilio auth token on our side.
+SIG_MAX_AGE_SECS = int(os.getenv("CALL_SIG_MAX_AGE_SECS", "1800"))
+
+
+def _dialout_secret() -> str:
+    return (os.getenv("DIALOUT_SECRET") or "").strip()
+
+
+def sign_call(to_number: str, row_id: str, ts: str) -> str:
+    msg = f"{to_number}|{row_id}|{ts}".encode()
+    return hmac.new(_dialout_secret().encode(), msg, hashlib.sha256).hexdigest()
+
+
+def verify_call(to_number: str, row_id: str, ts: str, sig: str) -> bool:
+    if not (_dialout_secret() and ts and sig):
+        return False
+    try:
+        age = time.time() - int(ts)
+    except ValueError:
+        return False
+    # The websocket opens when the callee answers, which can be a while after
+    # dialing (ringing + a phone menu), hence the generous window.
+    if age < -60 or age > SIG_MAX_AGE_SECS:
+        return False
+    return hmac.compare_digest(sign_call(to_number, row_id, ts), sig)
 
 
 # The context fields we forward from /dialout -> TwiML query params -> <Stream> params -> the bot.
@@ -100,8 +174,8 @@ async def dialout_request_from_request(request: Request) -> DialoutRequest:
     Raises:
         HTTPException: If required fields are missing or request data is invalid.
     """
-    data = await request.json()
     try:
+        data = await request.json()
         return DialoutRequest.model_validate(data)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid request data: {str(e)}")
@@ -124,10 +198,9 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
         ValueError: If required environment variables are missing.
     """
     to_number = dialout_request.to_number
-    # Fall back to the server's own Twilio number when the caller didn't supply one.
-    from_number = (dialout_request.from_number or os.getenv("TWILIO_FROM_NUMBER") or "").strip()
+    from_number = (os.getenv("TWILIO_FROM_NUMBER") or "").strip()
     if not from_number:
-        raise ValueError("Missing from_number (and TWILIO_FROM_NUMBER is unset)")
+        raise ValueError("TWILIO_FROM_NUMBER is unset")
 
     local_server_url = (os.getenv("LOCAL_SERVER_URL") or "").strip().rstrip("/")
     if not local_server_url:
@@ -138,8 +211,14 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
     from urllib.parse import urlencode
 
     ctx = {f: getattr(dialout_request, f, "") for f in CONTEXT_FIELDS if getattr(dialout_request, f, "")}
-    qs = ("?" + urlencode(ctx)) if ctx else ""
-    twiml_url = f"{local_server_url}/twiml{qs}"
+    ts = str(int(time.time()))
+    ctx["ts"] = ts
+    ctx["sig"] = sign_call(to_number, dialout_request.row_id, ts)
+    twiml_url = f"{local_server_url}/twiml?{urlencode(ctx)}"
+
+    if dialout_request.dry_run:
+        logger.info("dry_run: validated a call request without dialing")
+        return TwilioCallResult(call_sid="dry-run", to_number=to_number)
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
 
@@ -192,8 +271,17 @@ async def parse_twiml_request(request: Request) -> TwimlRequest:
     to_number = form_data.get("To")
     from_number = form_data.get("From")
 
+    # Only serve TwiML for a call our own /dialout created (see sign_call).
+    qp = request.query_params
+    if not verify_call(to_number or "", qp.get("row_id", ""), qp.get("ts", ""), qp.get("sig", "")):
+        logger.warning("Rejected /twiml request with a missing, bad or expired signature")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     # Our dietary context was passed as query params on the /twiml URL.
-    context = {f: request.query_params.get(f, "") for f in CONTEXT_FIELDS if request.query_params.get(f)}
+    context = {f: qp.get(f, "") for f in CONTEXT_FIELDS if qp.get(f)}
+    # Hand the signature on to the websocket so the bot can check it too.
+    context["ts"] = qp.get("ts", "")
+    context["sig"] = qp.get("sig", "")
 
     return TwimlRequest(to_number=to_number, from_number=from_number, context=context)
 
@@ -248,13 +336,6 @@ def generate_twiml(twiml_request: TwimlRequest) -> str:
     # Attach the dietary context so the bot can inject it into the tuned prompt.
     for name, value in (twiml_request.context or {}).items():
         stream.parameter(name=name, value=value)
-
-    # Add Pipecat Cloud service host for production
-    if os.getenv("ENV") == "production":
-        agent_name = os.getenv("AGENT_NAME")
-        org_name = os.getenv("ORGANIZATION_NAME")
-        service_host = f"{agent_name}.{org_name}"
-        stream.parameter(name="_pipecatCloudServiceHost", value=service_host)
 
     connect.append(stream)
     response.append(connect)
