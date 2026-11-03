@@ -951,11 +951,11 @@ async def run_bot(transport: BaseTransport, call_ctx: dict, handle_sigint: bool)
         # mute strategy below). Both ends env-tunable so we can retune without a
         # code change if live calls show we're still too eager or too slow.
         _opening_stop_secs = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
-        _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
-        # 4s of silence before replying suits a restaurant reading out a menu,
-        # but made a general call feel broken (long dead air after every answer).
-        if is_general(call_ctx):
-            _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS_GENERAL", "2.0"))
+        # Was 4.0 so a restaurant reading out a menu wasn't cut off, but on the
+        # 3 Nov test call it made every reply feel like dead air. The owner
+        # chose 2.0 for all calls; the prompt's "let them finish the list" rule
+        # and smart-turn's own end-of-turn model still cover mid-list pauses.
+        _patient_stop_secs = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "2.0"))
         # Read once, used by both the strategy and the status line below, so the
         # two can never disagree again.
         _turn_min_words = int(os.getenv("TURN_MIN_WORDS", "1"))

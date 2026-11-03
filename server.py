@@ -182,7 +182,7 @@ async def _preload_models():
     # would otherwise be swallowed by bot.py's per-call try/except and silently
     # drop every live call to pipecat's default (twitchy) turn-taking.
     _opening = float(os.getenv("SMART_TURN_OPENING_STOP_SECS", "1.0"))
-    _patient = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "4.0"))
+    _patient = float(os.getenv("SMART_TURN_PATIENT_STOP_SECS", "2.0"))
 
     # bot.py flips the analyzer from snappy->patient mid-call by writing these
     # PRIVATE attrs (no public API exists in 1.7.0). If a pipecat upgrade renames
