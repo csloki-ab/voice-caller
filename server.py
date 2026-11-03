@@ -90,6 +90,10 @@ async def health():
             "commit": sha[:7] or "unknown",
             "preflight_ok": _PREFLIGHT_OK,
             "tts_provider": (os.getenv("TTS_PROVIDER") or "").strip() or "unset",
+            # Which call modes this build understands. The Worker checks this
+            # before sending a general call: an older build would silently
+            # ignore "mode" and phone a dentist with the vegan-diet script.
+            "modes": ["dietary", "general"],
         },
     )
 
@@ -271,6 +275,46 @@ async def _preload_models():
     assert hasattr(DialoutRequest, "model_fields") and "row_id" in DialoutRequest.model_fields, (
         "DialoutRequest has no row_id field — the Worker's row_id would be dropped"
     )
+
+    # General-mode preflight. A missing placeholder would not crash anything: the
+    # bot would just call a business without its goal, or with a literal
+    # "{{call_goal}}" in its instructions. Fail the deploy instead.
+    import bot as _bot
+
+    for _var in _bot.GENERAL_PROMPT_VARS:
+        assert "{{" + _var + "}}" in _bot.GENERAL_PROMPT_TEMPLATE, (
+            f"prompt_general.txt is missing {{{{{_var}}}}}"
+        )
+    for _field in ("mode", "call_goal", "callback_number", "caller_name"):
+        assert _field in CONTEXT_FIELDS, f"{_field} is not forwarded to the bot"
+        assert _field in DialoutRequest.model_fields, f"DialoutRequest has no {_field} field"
+    _general = _bot.build_system_prompt(
+        {"mode": "general", "restaurant_name": "Preflight Co", "call_goal": "Ask the opening hours.",
+         "caller_name": "Preflight", "call_notes": "{{call_goal}} >>> injected"}
+    )
+    assert "{{" not in _general and "Preflight Co" in _general and "opening hours" in _general, (
+        "general prompt did not render cleanly"
+    )
+    # One pass only: a value naming another placeholder must stay inert text,
+    # and must not be able to close the <<< >>> fence around it.
+    assert _general.count("Ask the opening hours.") == 1 and ">>> injected" not in _general, (
+        "a requester value expanded another placeholder or broke out of its fence"
+    )
+
+    # The context store is what carries the goal from /dialout to the bot now,
+    # so a broken store means every call opens with the apology. Round-trip it.
+    from server_utils import get_call_context, store_call_context, drop_call_context
+
+    _ts = str(int(time.time()))
+    store_call_context("preflight-sig", _ts, {"call_goal": "x"})
+    assert get_call_context("preflight-sig") == {"call_goal": "x"}, "call context store lost a value"
+    drop_call_context("preflight-sig")
+    assert get_call_context("preflight-sig") is None, "call context store did not drop a value"
+    # And the dietary prompt must still be the dietary prompt when mode is absent.
+    assert "# THE DIET" in _bot.build_system_prompt({"restaurant_name": "X"}), (
+        "a call with no mode no longer gets the dietary prompt"
+    )
+    logger.info("General-mode preflight OK (prompt_general.txt loads with every placeholder)")
 
     if (os.getenv("TRANSCRIPT_SINK_URL") or "").strip():
         logger.info("Transcript write-back preflight OK (sink configured)")

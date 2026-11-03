@@ -28,9 +28,10 @@ Not the integration. Turn-taking.
 ## Files
 
 - `bot.py` - the Pipecat pipeline; loads `prompt.txt` and injects per-call context
-- `prompt.txt` - the dietary-inquiry prompt
+- `prompt.txt` - the dietary-inquiry prompt (used unless `mode` is `general`)
+- `prompt_general.txt` - the general-purpose prompt: calls any business with an owner-approved `call_goal` (`"mode": "general"` on `/dialout`; `restaurant_name` is the business name)
 - `server.py` - FastAPI: `POST /dialout` starts a call, `POST /twiml` is the Twilio callback, `WS /ws` carries media
-- `server_utils.py` - Twilio call and TwiML helpers
+- `server_utils.py` - Twilio call and TwiML helpers, plus the per-call context store. `/dialout` keeps each call's context (goal, notes, ...) in process memory, keyed by the call signature, and the `/twiml` URL and `<Stream>` parameters carry only `row_id`, `ts` and `sig`. **Run exactly one replica:** with two, Twilio could reach the one that never saw the `/dialout`. A restart between dialling and the answer loses the context, and the callee hears a one-line apology instead.
 - `pyproject.toml`, `Dockerfile`, `env.example`
 
 ## Configuration
@@ -38,6 +39,11 @@ Not the integration. Turn-taking.
 See `env.example`. You need a Deepgram key, an Anthropic key, an ElevenLabs key and voice id, and
 Twilio credentials plus a purchased number. Secrets go in the host's environment panel, never in the
 repo.
+
+- Recording: dietary calls are recorded (`CALL_RECORDING`, default on). General calls are not,
+  unless `CALL_RECORDING_GENERAL=on`, because two-party-consent states need everyone's consent.
+- `CALL_OUTCOME_SUMMARY` (default on): when a call ends, one short Anthropic call
+  (`ANTHROPIC_MODEL`) writes a few sentences on the outcome, sent with the transcript.
 
 ## Deploy
 
