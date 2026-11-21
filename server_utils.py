@@ -312,6 +312,11 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
     ts = str(int(time.time()))
     sig = sign_call(to_number, dialout_request.row_id, ts)
     twiml_url = f"{local_server_url}/twiml?{urlencode({'row_id': dialout_request.row_id, 'ts': ts, 'sig': sig})}"
+    # Twilio tells us how the call ENDED (busy, no-answer, failed...). Without
+    # this, a call nobody picked up looked exactly like one that connected and
+    # lost its transcript: on 20 Nov 2026 six unanswered calls were reported as
+    # "placed and answered". Same signature as /twiml, so it cannot be forged.
+    status_url = f"{local_server_url}/call-status?{urlencode({'row_id': dialout_request.row_id, 'ts': ts, 'sig': sig})}"
 
     if dialout_request.dry_run:
         logger.info("dry_run: validated a call request without dialing")
@@ -347,6 +352,9 @@ async def make_twilio_call(dialout_request: DialoutRequest) -> TwilioCallResult:
             method="POST",
             record=record,
             recording_channels="dual",
+            status_callback=status_url,
+            status_callback_method="POST",
+            status_callback_event=["completed"],
         # Hard backstop so a silent/voicemail line can't sit open running up cost.
         # Was 360s (6 min) but a patient real call — restaurant reading a full
         # curated list slowly — hit that cap mid-conversation and got cut off.
@@ -460,3 +468,33 @@ def generate_twiml(twiml_request: TwimlRequest) -> str:
     response.pause(length=20)
 
     return str(response)
+
+
+# Twilio's final statuses for a call that never became a conversation.
+NOT_CONNECTED_STATUSES = {"busy", "no-answer", "failed", "canceled"}
+
+
+async def report_call_status(row_id: str, call_status: str) -> bool:
+    """Tell the Worker a call ended without connecting, so the row says why.
+
+    Best-effort, like the transcript write-back: bookkeeping must never raise.
+    """
+    url = (os.getenv("TRANSCRIPT_SINK_URL") or "").strip()
+    if not url or not row_id or call_status not in NOT_CONNECTED_STATUSES:
+        return False
+    secret = (os.getenv("TRANSCRIPT_SINK_SECRET") or os.getenv("DIALOUT_SECRET") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Transcript-Secret"] = secret
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(url, json={"id": row_id, "call_status": call_status}, headers=headers) as resp:
+                if resp.status == 200:
+                    logger.info(f"Call status '{call_status}' saved to D1 row {row_id}")
+                    return True
+                logger.warning(f"Call status write-back failed HTTP {resp.status}: {(await resp.text())[:200]}")
+    except Exception as e:
+        logger.warning(f"Call status write-back failed ({e})")
+    return False

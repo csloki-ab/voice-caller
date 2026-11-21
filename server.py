@@ -28,6 +28,10 @@ from server_utils import (
     generate_twiml,
     make_twilio_call,
     parse_twiml_request,
+    NOT_CONNECTED_STATUSES,
+    drop_call_context,
+    report_call_status,
+    verify_call,
 )
 
 load_dotenv(override=True)
@@ -422,6 +426,32 @@ async def get_twiml(request: Request) -> HTMLResponse:
     twiml_content = generate_twiml(twiml_request)
 
     return HTMLResponse(content=twiml_content, media_type="application/xml")
+
+
+@app.post("/call-status")
+async def call_status(request: Request) -> dict:
+    """Twilio's final status for a call we placed (see make_twilio_call).
+
+    Only the not-connected endings are forwarded; a completed call reports
+    itself through its transcript. Signed like /twiml, so a stranger cannot
+    mark a row as unanswered.
+    """
+    q = request.query_params
+    row_id, ts, sig = q.get("row_id", ""), q.get("ts", ""), q.get("sig", "")
+    try:
+        form = await request.form()
+    except Exception:
+        form = {}
+    to_number = str(form.get("To") or "")
+    status = str(form.get("CallStatus") or "").lower()
+    if not verify_call(to_number, row_id, ts, sig):
+        logger.warning("Rejected /call-status with a missing or bad signature")
+        raise HTTPException(status_code=403, detail="Forbidden")
+    logger.info(f"Twilio final status for row {row_id}: {status or '?'}")
+    if status in NOT_CONNECTED_STATUSES:
+        drop_call_context(sig)
+        await report_call_status(row_id, status)
+    return {"ok": True}
 
 
 @app.websocket("/ws")
