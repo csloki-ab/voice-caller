@@ -469,10 +469,16 @@ _ZERO_TEXT_RETRY_PROMPT = (
 # completion with an empty message list, so a bare run frame 400s.
 # Deliberately mode-neutral (no food, no diet): the same nudge serves dietary
 # and general calls, and each system prompt says how to open.
+# It used to say "greet them and check you have reached the right place", which
+# made the bot open with "Hi there, is this X?". On 21 Nov 2026 that line was
+# the first thing six restaurants heard and all six hung up on it; every call
+# that got the normal short opener instead stayed on the line.
 _OPENING_NUDGE = (
     "The line is open and they have picked up, but nothing they said came through. "
-    "Speak first now: greet them and check you have reached the right place, in one "
-    "short sentence. Do not mention the silence or the transcription."
+    "Speak first now: say your normal opening line from your instructions, exactly "
+    "as you would have after hearing their greeting, in one short sentence. Do NOT "
+    "ask whether this is the right place or say the business's name as a question. "
+    "Do not mention the silence or the transcription."
 )
 
 
